@@ -1,0 +1,116 @@
+diff --git a/lib/index.js b/lib/index.js
+index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..328ba3af00dcac9d4e4a508c8a9d87bcded438b0 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -14,6 +14,7 @@ import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
+ import { homedir } from "node:os";
+ import { access } from "node:fs/promises";
+ import { resolve } from "node:path";
++import { ProxyAgent, fetch as undiciFetch } from "undici";
+ //#region lib/types/replay.js
+ /**
+ * Durable pi-ai replay metadata and assistant-history reconstruction.
+@@ -1019,6 +1020,7 @@ const profile = z.object({
+ 	displayName: z.string(),
+ 	api: z.union(supportedProtocols()),
+ 	baseURL: z.string(),
++	proxyUrl: z.string(),
+ 	models: z.array(modelProfile),
+ 	modelOverrides: z.dict(modelOverride),
+ 	compat: compatProfile,
+@@ -1670,6 +1672,18 @@ var __disposeResources = (function(SuppressedError) {
+ 	var e = new Error(message);
+ 	return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
+ });
++const proxyFetchers = /* @__PURE__ */ new Map();
++function proxyFetch(proxyUrl) {
++	let fetcher = proxyFetchers.get(proxyUrl);
++	if (fetcher !== void 0) return fetcher;
++	const url = new URL(proxyUrl);
++	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(`llm-pi-ai proxyUrl only supports HTTP(S): ${url.protocol}`);
++	const dispatcher = new ProxyAgent(url);
++	// ponytail: one dispatcher per configured URL; add eviction only if live proxy churn becomes real.
++	fetcher = (input, init) => undiciFetch(input, { ...init, dispatcher });
++	proxyFetchers.set(proxyUrl, fetcher);
++	return fetcher;
++}
+ /** Copy profile stream knobs into pi-ai's common option vocabulary. */
+ function profileOptions(profile, reasoning, apiKey) {
+ 	const enabledReasoning = reasoning === "off" ? void 0 : reasoning;
+@@ -1679,6 +1693,7 @@ function profileOptions(profile, reasoning, apiKey) {
+ 		...profile.thinkingBudgets === void 0 ? {} : { thinkingBudgets: profile.thinkingBudgets },
+ 		...profile.cacheRetention === void 0 ? {} : { cacheRetention: profile.cacheRetention },
+ 		...profile.transport === void 0 ? {} : { transport: profile.transport },
++		...profile.proxyUrl === void 0 ? {} : { fetch: proxyFetch(profile.proxyUrl) },
+ 		...profile.timeoutMs === void 0 ? {} : { timeoutMs: profile.timeoutMs },
+ 		...profile.websocketConnectTimeoutMs === void 0 ? {} : { websocketConnectTimeoutMs: profile.websocketConnectTimeoutMs },
+ 		maxRetries: 0
+@@ -2564,7 +2579,7 @@ function apply(ctx, config) {
+ 		const ref = profile.apiKeyEnv;
+ 		if (ref === void 0) return void 0;
+ 		const credentials = ctx.get("credentials");
+-		const hit = credentials !== void 0 ? (await credentials.resolve(ref))?.value : launchEnvironmentOf(ctx).get(ref)?.value;
++		const hit = credentials !== void 0 ? (await credentials.resolve(ref, { proxyUrl: profile.proxyUrl }))?.value : launchEnvironmentOf(ctx).get(ref)?.value;
+ 		if (hit !== void 0 && hit.length > 0) return assertUsableApiKey(hit, "llm-pi-ai", ref);
+ 		throw new LlmError(`llm-pi-ai: no credential for provider route "${provider}"; its profile resolves ${ref}, which is not set — store ${ref} through the credentials service (the web Models page writes it) or export it, and remove apiKeyEnv only if this provider should authenticate from pi-ai's own environment discovery`, "MISSING_CREDENTIAL");
+ 	};
+diff --git a/lib/types/config.d.ts b/lib/types/config.d.ts
+index f45d7d97a520ee50a2198357c40bca484c991f1d..4cdd23f9a10bdd8435b39c9f5e626b0037fd271c 100644
+--- a/lib/types/config.d.ts
++++ b/lib/types/config.d.ts
+@@ -64,6 +64,8 @@ export interface PiAiProviderProfile {
+     api?: string;
+     /** Endpoint for this route's models; defaults to the installed catalog's endpoint. */
+     baseURL?: string;
++    /** HTTP(S) forward proxy used only by this provider route. */
++    proxyUrl?: string;
+     /**
+      * This route's model catalog. Omission serves the installed catalog for the
+      * route unchanged; an explicit list replaces it, each entry defaulting its
+@@ -197,6 +199,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName?: string | null;
+         api?: string | null;
+         baseURL?: string | null;
++        proxyUrl?: string | null;
+         models?: PiAiModelProfile[] | null;
+         modelOverrides?: import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string> | null;
+         compat?: PiAiCompatProfile | null;
+@@ -225,6 +228,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName: z<string, string, "plain">;
+         api: z<string, string, "plain">;
+         baseURL: z<string, string, "plain">;
++        proxyUrl: z<string, string, "plain">;
+         models: z<PiAiModelProfile[], PiAiModelProfile[], "plain">;
+         modelOverrides: z<import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, "plain">;
+         compat: z<PiAiCompatProfile>;
+@@ -260,6 +264,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName?: string | null;
+         api?: string | null;
+         baseURL?: string | null;
++        proxyUrl?: string | null;
+         models?: PiAiModelProfile[] | null;
+         modelOverrides?: import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string> | null;
+         compat?: PiAiCompatProfile | null;
+@@ -288,6 +293,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName: z<string, string, "plain">;
+         api: z<string, string, "plain">;
+         baseURL: z<string, string, "plain">;
++        proxyUrl: z<string, string, "plain">;
+         models: z<PiAiModelProfile[], PiAiModelProfile[], "plain">;
+         modelOverrides: z<import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, "plain">;
+         compat: z<PiAiCompatProfile>;
+diff --git a/package.json b/package.json
+index 4a3b50dda7cd148b6be4de3656252ee5ab747693..95107440219c51d4fd23a422e474ac8a3ff511e0 100644
+--- a/package.json
++++ b/package.json
+@@ -41,7 +41,8 @@
+     "@earendil-works/pi-ai": "^0.87.1",
+     "@deepseek-ai/dsh-brand": "0.2.0-rc.2",
+     "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
+-    "@deepseek-ai/schemastery": "~3.18.4"
++    "@deepseek-ai/schemastery": "~3.18.4",
++    "undici": "^8.11.2"
+   },
+   "devDependencies": {
+     "@deepseek-ai/cordis": "~4.0.4",
+

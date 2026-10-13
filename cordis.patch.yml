@@ -1,0 +1,12 @@
+# Add one credential bridge and configure the stock pi-ai adapter's native
+# openai-codex provider. The access token stays in Codex's own auth.json.
+- id: llm-pi-ai
+  config:
+    providers:
+      openai-codex:
+        displayName: OpenAI Codex (Codex CLI login)
+        apiKeyEnv: OPENAI_CODEX_AUTH
+
+- insert:
+    - id: codex-cli-auth
+      name: deepseek-harness-codex-auth
