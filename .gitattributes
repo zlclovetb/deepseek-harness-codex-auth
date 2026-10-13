@@ -1,0 +1,3 @@
+# Patch files are consumed byte-wise by pnpm (`patchedDependencies`) and git apply.
+# `core.autocrlf = true` would rewrite them to CRLF on checkout and break application.
+patches/*.patch -text

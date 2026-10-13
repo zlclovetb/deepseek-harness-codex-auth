@@ -1,5 +1,5 @@
 diff --git a/lib/index.js b/lib/index.js
-index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..328ba3af00dcac9d4e4a508c8a9d87bcded438b0 100644
+index 0c74b3a..9cac036 100644
 --- a/lib/index.js
 +++ b/lib/index.js
 @@ -14,6 +14,7 @@ import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
@@ -18,7 +18,7 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..328ba3af00dcac9d4e4a508c8a9d87bc
  	models: z.array(modelProfile),
  	modelOverrides: z.dict(modelOverride),
  	compat: compatProfile,
-@@ -1670,6 +1672,18 @@ var __disposeResources = (function(SuppressedError) {
+@@ -1670,8 +1672,37 @@ var __disposeResources = (function(SuppressedError) {
  	var e = new Error(message);
  	return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
  });
@@ -34,18 +34,47 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..328ba3af00dcac9d4e4a508c8a9d87bc
 +	proxyFetchers.set(proxyUrl, fetcher);
 +	return fetcher;
 +}
++/**
++* The transport one profile's requests use.
++*
++* This route keeps its own proxy decision: the plugin's rotation layer only
++* wraps whatever transport is chosen here, so adding quota observation can never
++* change whether — or through where — a request reaches the network.
++*
++* @param ctx - host context, where the credential plugin may have provided a pool.
++* @param profile - the resolved provider profile.
++* @returns the fetch to inject, or `undefined` when neither a proxy nor a pool applies.
++*/
++function profileFetch(ctx, profile) {
++	const base = profile.proxyUrl === void 0 ? void 0 : proxyFetch(profile.proxyUrl);
++	const rotation = ctx.get("codexMultiAuth");
++	if (rotation === void 0) return base;
++	return rotation.wrapFetch(base);
++}
  /** Copy profile stream knobs into pi-ai's common option vocabulary. */
- function profileOptions(profile, reasoning, apiKey) {
+-function profileOptions(profile, reasoning, apiKey) {
++function profileOptions(profile, reasoning, apiKey, fetchImpl) {
  	const enabledReasoning = reasoning === "off" ? void 0 : reasoning;
-@@ -1679,6 +1693,7 @@ function profileOptions(profile, reasoning, apiKey) {
+ 	return {
+ 		...apiKey === void 0 ? {} : { apiKey },
+@@ -1679,6 +1710,7 @@ function profileOptions(profile, reasoning, apiKey) {
  		...profile.thinkingBudgets === void 0 ? {} : { thinkingBudgets: profile.thinkingBudgets },
  		...profile.cacheRetention === void 0 ? {} : { cacheRetention: profile.cacheRetention },
  		...profile.transport === void 0 ? {} : { transport: profile.transport },
-+		...profile.proxyUrl === void 0 ? {} : { fetch: proxyFetch(profile.proxyUrl) },
++		...fetchImpl === void 0 ? {} : { fetch: fetchImpl },
  		...profile.timeoutMs === void 0 ? {} : { timeoutMs: profile.timeoutMs },
  		...profile.websocketConnectTimeoutMs === void 0 ? {} : { websocketConnectTimeoutMs: profile.websocketConnectTimeoutMs },
  		maxRetries: 0
-@@ -2564,7 +2579,7 @@ function apply(ctx, config) {
+@@ -1879,7 +1911,7 @@ var PiAiAdapter = class extends LlmAdapter {
+ 					}
+ 				}, onReplayDegrade);
+ 				const iterator = toStreamChunks(snapshot.models.streamSimple(model, context, {
+-					...profileOptions(profile, reasoning, apiKey),
++						...profileOptions(profile, reasoning, apiKey, this.config.fetchFor?.(profile)),
+ 					...options.temperature === void 0 ? {} : { temperature: options.temperature },
+ 					...options.maxTokens === void 0 ? {} : { maxTokens: options.maxTokens },
+ 					...options.sessionId === void 0 ? {} : { sessionId: String(options.sessionId) },
+@@ -2564,7 +2596,7 @@ function apply(ctx, config) {
  		const ref = profile.apiKeyEnv;
  		if (ref === void 0) return void 0;
  		const credentials = ctx.get("credentials");
@@ -54,8 +83,16 @@ index 0c74b3ab2b556f4b0e656a304e1242ffceb8c288..328ba3af00dcac9d4e4a508c8a9d87bc
  		if (hit !== void 0 && hit.length > 0) return assertUsableApiKey(hit, "llm-pi-ai", ref);
  		throw new LlmError(`llm-pi-ai: no credential for provider route "${provider}"; its profile resolves ${ref}, which is not set — store ${ref} through the credentials service (the web Models page writes it) or export it, and remove apiKeyEnv only if this provider should authenticate from pi-ai's own environment discovery`, "MISSING_CREDENTIAL");
  	};
+@@ -2575,6 +2607,7 @@ function apply(ctx, config) {
+ 	const adapter = new PiAiAdapter({
+ 		profiles,
+ 		resolveApiKey,
++		fetchFor: (profile) => profileFetch(ctx, profile),
+ 		auth,
+ 		resolveAttachments: () => ctx.get("attachments"),
+ 		resolveImageAccess: (attachments, ref) => resolveImageAttachmentAccess(attachments, (hostPath) => ctx.get("fs")?.processPathFromHostPath(hostPath), ref),
 diff --git a/lib/types/config.d.ts b/lib/types/config.d.ts
-index f45d7d97a520ee50a2198357c40bca484c991f1d..4cdd23f9a10bdd8435b39c9f5e626b0037fd271c 100644
+index f45d7d9..9323de4 100644
 --- a/lib/types/config.d.ts
 +++ b/lib/types/config.d.ts
 @@ -64,6 +64,8 @@ export interface PiAiProviderProfile {
@@ -99,18 +136,3 @@ index f45d7d97a520ee50a2198357c40bca484c991f1d..4cdd23f9a10bdd8435b39c9f5e626b00
          models: z<PiAiModelProfile[], PiAiModelProfile[], "plain">;
          modelOverrides: z<import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, "plain">;
          compat: z<PiAiCompatProfile>;
-diff --git a/package.json b/package.json
-index 4a3b50dda7cd148b6be4de3656252ee5ab747693..95107440219c51d4fd23a422e474ac8a3ff511e0 100644
---- a/package.json
-+++ b/package.json
-@@ -41,7 +41,8 @@
-     "@earendil-works/pi-ai": "^0.87.1",
-     "@deepseek-ai/dsh-brand": "0.2.0-rc.2",
-     "@deepseek-ai/dsh-util-values": "0.2.0-rc.2",
--    "@deepseek-ai/schemastery": "~3.18.4"
-+    "@deepseek-ai/schemastery": "~3.18.4",
-+    "undici": "^8.11.2"
-   },
-   "devDependencies": {
-     "@deepseek-ai/cordis": "~4.0.4",
-

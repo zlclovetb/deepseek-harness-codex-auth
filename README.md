@@ -1,10 +1,57 @@
 # deepseek-harness-codex-auth
 
-让 DeepSeek Harness 的官方 `llm-pi-ai` 适配器直接复用 Codex CLI 的 ChatGPT 登录。
+让 DeepSeek Harness 的官方 `llm-pi-ai` 适配器直接复用 Codex CLI 的 ChatGPT 登录，并支持
+**多个 Codex 账号自动轮换**。
 
-插件只拦截 `OPENAI_CODEX_AUTH` 这一条凭据引用：设置页显示 Codex CLI 的只读登录状态，每次模型请求读取
-`$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`），access token 即将过期时按
-Codex CLI 的协议刷新并写回同一文件。token 不会复制到 Harness 配置或凭据文件。
+插件只拦截 `OPENAI_CODEX_AUTH` 这一条凭据引用：设置页显示 Codex CLI 的只读登录状态，每次模型
+请求按当前额度挑一个账号，读取它的 `auth.json`，access token 即将过期时按 Codex CLI 的协议刷新
+并写回同一文件。token 不会复制到 Harness 配置或凭据文件。
+
+## 账号布局
+
+```text
+$CODEX_HOME/                     # 默认 ~/.codex
+├── auth.json                    # 单账号（旧布局，继续支持）
+└── accounts/                    # 多账号布局
+    ├── work/auth.json
+    └── personal/auth.json
+```
+
+- 存在 `$CODEX_HOME/accounts/<name>/auth.json` 子目录时，插件把它们当作账号池；
+- 没有该目录时回退到单一 `$CODEX_HOME/auth.json`（账号 id `default`），行为与旧版一致；
+- 当前目录可用插件配置 `accountsDir` 或环境变量 `CODEX_ACCOUNTS_DIR` 覆盖；
+- 每个子目录由 `codex login` 生成即可，例如 `CODEX_HOME=~/.codex/accounts/work codex login`。
+
+## 轮换与额度
+
+额度来自两个渠道，都会写进进程内的账号状态：
+
+- **被动**：每个模型响应的 `x-codex-primary-used-percent`（5 小时窗口）与
+  `x-codex-secondary-used-percent`（本周窗口）等响应头；
+- **主动**（可选，`quotaProbe: true`）：在把请求交给某个账号之前，先读一次
+  `chatgpt.com/backend-api/wham/usage`。
+
+调度策略由 `strategy` 决定：
+
+| 值 | 行为 |
+| --- | --- |
+| `hybrid`（默认） | 在可用账号中选「剩余额度 × 健康分」最高者 |
+| `round-robin` | 在可用账号间轮流 |
+| `sticky` | 固定一个账号，直到它的窗口耗尽 |
+
+某个账号额度耗尽（任一窗口达到 100%）或返回 429 时，它会被冷落到该窗口的重置时间；后续请求自动
+切到别的账号。**切换发生在下一个请求**，不会在一次请求内重放。
+
+## 配置
+
+`cordis.patch.yml` 的 `insert` 条目带以下配置（均为可选，括号内为默认值）：
+
+| 键 | 说明 |
+| --- | --- |
+| `accountsDir` | 账号目录（默认 `$CODEX_HOME/accounts`） |
+| `strategy` | `hybrid` / `round-robin` / `sticky`（默认 `hybrid`） |
+| `quotaProbe` | 是否在请求前主动探测额度（默认 `false`） |
+| `rotateOnQuotaExhausted` | 设为 `false` 等价于 `strategy: sticky`（默认 `true`） |
 
 ## 安装
 
@@ -20,7 +67,7 @@ codex login status
 ```powershell
 npm test
 npm pack
-dsh plugin --profile web add .\deepseek-harness-codex-auth-0.2.2.tgz
+dsh plugin --profile web add .\deepseek-harness-codex-auth-0.3.2.tgz
 dsh --profile web --dump-config
 dsh web
 ```
@@ -29,8 +76,9 @@ Bundle patch 会保留官方 `llm-pi-ai`，只加入 `openai-codex` 路由和认
 模型选择器中选择 `openai-codex` 下的模型。
 
 Web profile 同时应用 `patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch` 后，模型页的
-`openai-codex` 卡片会出现“网络代理”输入框。该代理只用于此 provider；建议同时把
-`transport` 设为 `sse`，避免不支持 WebSocket 的 HTTP 代理先等待握手超时。
+`openai-codex` 卡片会出现「网络代理」输入框和「多账号额度」面板。代理只用于此 provider；
+建议同时把 `transport` 设为 `sse`，避免不支持 WebSocket 的 HTTP 代理先等待握手超时。
+额度面板每 15 秒读取一次宿主同源的 `/api/codex-pool`，展示各账号的 5 小时 / 本周用量与可用状态。
 
 卸载：
 
@@ -38,8 +86,125 @@ Web profile 同时应用 `patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch` 
 dsh plugin --profile web remove deepseek-harness-codex-auth
 ```
 
+## 官方包补丁与升级适配
+
+额度显示依赖对官方 `@deepseek-ai/dsh-llm-pi-ai` 的一处补丁。**官方包一升级，补丁就会失效**，
+面板会退回「暂无数据」。因此这里写清「改了哪些代码、为什么这么改」，供下次升级时照着重新适配。
+
+### 为什么必须改官方包
+
+`llm-pi-ai` 负责发模型请求，插件只能从它留下的接口接入。原版有两个缺口：
+
+| 需要的能力 | 原版现状 | 后果 |
+| --- | --- | --- |
+| 拿到本次请求用的 transport | `profileOptions()` 不向 pi-ai 传 `fetch`，pi-ai 只能回落到 `globalThis.fetch` | 观测层无处可挂，额度永远是空的 |
+| 每 provider 独立代理 | provider profile 里没有 `proxyUrl` 字段 | 代理配置无处可放 |
+
+### 改动清单
+
+补丁文件：[patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch](patches)
+
+| # | 位置 | 改动 | 为什么 |
+| --- | --- | --- | --- |
+| 1 | 顶部 import | 引入 `undici` 的 `ProxyAgent` / `fetch` | 代理出口 |
+| 2 | provider profile schema | 增加 `proxyUrl: z.string()` | 让 profile 能带代理 |
+| 3 | 新增 `proxyFetch(proxyUrl)` | 按 URL 缓存 `ProxyAgent`，返回带 `dispatcher` 的 fetch | **原样保留既有代理逻辑**：网络出口只由这里决定 |
+| 4 | 新增 `profileFetch(ctx, profile)` | `base = proxyUrl ? proxyFetch(proxyUrl) : undefined`；再 `ctx.get("codexMultiAuth")?.wrapFetch(base)` | 把观测层**包在代理外层**：请求怎么出去完全不变，只是顺路读一眼响应 |
+| 5 | `profileOptions(...)` | 增加第 4 参 `fetchImpl`，透传 `{ fetch: fetchImpl }` | 把上面选好的 fetch 交给 pi-ai |
+| 6 | 模型请求调用点 | `profileOptions(profile, reasoning, apiKey, this.config.fetchFor?.(profile))` | 接线 |
+| 7 | `PiAiAdapter` 构造 | `fetchFor: (profile) => profileFetch(ctx, profile)` | 接线 |
+| 8 | `resolveApiKey` | `credentials.resolve(ref, { proxyUrl: profile.proxyUrl })` | 令牌刷新、额度探测与模型请求走**同一个**出口 |
+| 9 | `lib/types/config.d.ts` | 补 `proxyUrl` 类型声明 | 类型完整 |
+
+第 4 项的三态是整套设计的关键 —— **补丁单独存在时不改变任何行为**：
+
+```js
+function profileFetch(ctx, profile) {
+  const base = profile.proxyUrl === undefined ? undefined : proxyFetch(profile.proxyUrl);
+  const rotation = ctx.get("codexMultiAuth");   // 本插件提供的观测层
+  if (rotation === undefined) return base;      // 没装插件 → 与打补丁前一致
+  return rotation.wrapFetch(base);              // 装了插件 → 只在其外层读响应
+}
+```
+
+无代理且无插件时返回 `undefined`，`fetch` 选项**根本不注入**，与打补丁前逐字一致；观测层
+永远在最外层，即使它彻底不工作，请求路径也不变。
+
+### 补丁如何生效
+
+不需要手动改 `node_modules`。补丁由 pnpm 通过 profile 的 `pnpm-workspace.yaml`
+`patchedDependencies` 自动应用，`dsh plugin add` 也会重放它。
+
+两点容易踩：
+
+- **要落在 web profile 实际加载的那份**。磁盘上有多份 `dsh-llm-pi-ai`（CLI 安装树、
+  `profiles/node_modules` 共享层、`profiles/web/node_modules` 私有层），运行时生效的是
+  最后一份 —— 检查目标应是
+  `…\.dsh\profiles\web\node_modules\@deepseek-ai\dsh-llm-pi-ai\lib\index.js`。
+- 补丁**没有**修改官方包的 `package.json`，它 `import "undici"` 时依赖的是 web profile 里
+  被提升上来的 `undici@8.11.2`（本插件的依赖）。升级后确认它仍能解析。
+
+### 升级后如何重新适配
+
+前提：只要 `profiles/web/package.json` 仍锁定 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2`，
+补丁就一直有效 —— 升级 DSH 应用本体不会自动改它。只有 profile 里的版本真的变了才需要走下面流程。
+
+```powershell
+# 1. 确认实际加载的版本与补丁状态（应至少各命中一次）
+$f = "$env:USERPROFILE\.dsh\profiles\web\node_modules\@deepseek-ai\dsh-llm-pi-ai\lib\index.js"
+Select-String -Path $f -Pattern "profileFetch","codexMultiAuth","fetchFor"
+
+# 2. 把补丁文件重命名到新版本
+#    patches/@deepseek-ai__dsh-llm-pi-ai@<新版本>.patch
+#    并同步更新 profiles/web/pnpm-workspace.yaml 里 patchedDependencies 的 key
+
+# 3. 逐条重做上表 9 处改动。原版里可直接搜索这些锚点：
+#    ① import { resolve } from "node:path";          （import 区块）
+#    ② baseURL: z.string(),                          （provider profile schema）
+#    ③ var __disposeResources = (function (SuppressedError) {   （在其后插入 3、4）
+#    ④ function profileOptions(profile, reasoning, apiKey) {    （第 5 项）
+#    ⑤ ...profileOptions(profile, reasoning, apiKey),            （第 6 项）
+#    ⑥ const adapter = new PiAiAdapter({
+#         profiles,
+#         resolveApiKey,                            （第 7 项）
+#    ⑦ (await credentials.resolve(ref))?.value       （第 8 项）
+
+# 4. 让 pnpm 重新应用补丁（必须带 --no-frozen-lockfile，patch_hash 会变）
+pnpm install --no-frozen-lockfile
+
+# 5. 校验补丁落地后重启
+node --check "$f"
+dsh web
+```
+
+### 怎么知道补丁还生效
+
+补丁一旦失效，额度面板不再是一片空白，而是直接告警：
+
+> ⚠ 额度观测未生效：当前 llm-pi-ai 未适配本插件（补丁未应用，或官方包升级后补丁已失效）。
+> 账号切换仍然可用，但额度不会更新。
+
+判据是宿主 `GET /api/codex-pool` 返回的 `integration` 字段 —— 插件自身就能分辨「还没请求过」
+和「补丁没生效」，不需要去猜文件路径：
+
+```jsonc
+{
+  "integration": {
+    "hooked": true,        // 补丁调过 wrapFetch → 整条链路通了
+    "stockAdapter": false  // 原版适配器解析凭据时不带 options；为 true 即未打补丁
+  }
+}
+```
+
+| `hooked` | `stockAdapter` | 含义 |
+| --- | --- | --- |
+| `true` | — | 补丁生效 |
+| `false` | `true` | **补丁失效**，面板告警 |
+| `false` | `false` | 还没发过请求，属于正常等待 |
+
 ## 边界
 
 - 复用的是 Codex CLI 的登录凭据，不会导入 Codex 历史对话。
-- 当前只支持文件型 `$CODEX_HOME/auth.json`；若 Codex 配置为仅存系统钥匙串，插件会明确报错。
+- 只支持文件型 `auth.json`；若 Codex 配置为仅存系统钥匙串，插件会明确报错。
+- 额度状态保存在进程内存里，重启后从零开始观测。
 - 这是本机可信插件：它与 Codex CLI 共享 refresh token，请勿安装到不可信 Harness profile。

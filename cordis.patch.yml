@@ -10,3 +10,15 @@
 - insert:
     - id: codex-cli-auth
       name: deepseek-harness-codex-auth
+      # Optional pool settings; the values below are the defaults.
+      config:
+        # Per-account logins live at <accountsDir>/<name>/auth.json. Defaults to
+        # $CODEX_HOME/accounts, and falls back to a lone $CODEX_HOME/auth.json.
+        # accountsDir: "C:/Users/me/.codex/accounts"
+        # hybrid keeps using the account with the most headroom, round-robin
+        # cycles evenly, sticky pins one account until its window is spent.
+        strategy: hybrid
+        # Actively read each account's usage before it is handed a request.
+        quotaProbe: false
+        # false is equivalent to strategy: sticky.
+        rotateOnQuotaExhausted: true

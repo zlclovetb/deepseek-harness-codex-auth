@@ -1,7 +1,7 @@
 # Code Wiki — deepseek-harness-codex-auth
 
 DeepSeek Harness 插件：让官方 `llm-pi-ai` 适配器直接复用 **Codex CLI** 的 ChatGPT 登录凭据，
-无需把 access token 复制到 Harness 配置中。
+无需把 access token 复制到 Harness 配置中；支持**多个 Codex 账号**按额度自动轮换。
 
 本 Wiki 面向需要理解、维护或二次开发该插件的工程师。
 
@@ -24,16 +24,22 @@ DeepSeek Harness 插件：让官方 `llm-pi-ai` 适配器直接复用 **Codex CL
   - 浏览器端：[client.js](../client.js)
 - **核心机制**：拦截名为 `OPENAI_CODEX_AUTH` 的**单条**凭据引用，改为实时读取
   `$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`），必要时按 Codex CLI 协议刷新并原子写回。
-- **依赖**：仅一个运行时依赖 `undici`；其余能力（`credentials` / `slots` / `configForms`）由宿主
-  DeepSeek Harness 注入。
+- **账号池**：`$CODEX_HOME/accounts/<name>/auth.json` 存在时按多个账号轮换；额度取自响应头，
+  亦可选主动探测。无该目录时回退到单账号，行为与旧版一致。
+- **依赖**：仅一个运行时依赖 `undici`；其余能力（`credentials` / `slots` / `configForms` /
+  `webServer`）由宿主 DeepSeek Harness 注入。
 
 ## 快速定位
 
 | 想了解 | 去哪里 |
 | --- | --- |
 | token 怎么读、怎么刷新、怎么避免并发重复刷新 | [03-api-reference.md](./03-api-reference.md#resolvecodexcredential) |
-| `apply(ctx)` 如何打桩 `credentials` | [03-api-reference.md](./03-api-reference.md#applyctx) |
+| `apply(ctx)` 如何打桩 `credentials` | [03-api-reference.md](./03-api-reference.md#applyctx-config) |
+| 多账号怎么发现、怎么挑、额度怎么记 | [03-api-reference.md](./03-api-reference.md#lib-账号池) |
+| 「额度面板」的数据从哪来 | [03-api-reference.md](./03-api-reference.md#quotapanelprovider) |
 | `cordis.patch.yml` 如何注册路由与桥接 | [02-modules.md](./02-modules.md#cordispatchyml--bundle-patch) |
 | 设置页“网络代理”输入框怎么来的 | [02-modules.md](./02-modules.md#clientjs--浏览器端模块) |
-| `proxyUrl` 补丁改了官方包的哪些地方 | [04-dependencies.md](./04-dependencies.md#补丁-patch-chan) |
+| `proxyUrl` 补丁改了官方包的哪些地方 | [04-dependencies.md](./04-dependencies.md#5-补丁patch详解) |
+| 官方包升级后补丁怎么重做 | [README.md](../README.md#官方包补丁与升级适配) |
+| 面板显示「额度观测未生效」怎么办 | [README.md](../README.md#怎么知道补丁还生效) |
 | 怎么安装、跑测试、卸载 | [05-usage.md](./05-usage.md) |
