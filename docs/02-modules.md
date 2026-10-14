@@ -16,7 +16,7 @@ deepseek-harness-codex-auth/
 │   └── @deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch   # 给官方包增加 proxyUrl/fetch 注入点
 ├── test/
 │   ├── auth.test.js         # 认证桥单测（4 例）
-│   └── pool.test.js         # 账号池 / 额度 / 轮换单测（7 例）
+│   └── pool.test.js         # 账号池 / 额度 / 轮换 / 预热单测（13 例）
 ├── package.json             # 包元数据 + dsh bundle/client 声明
 ├── package-lock.json        # 依赖锁（undici）
 ├── README.md                # 面向使用者的说明
@@ -47,13 +47,13 @@ deepseek-harness-codex-auth/
 **内部结构（分区）**
 
 - **配置区**：`configValue()`（兼容 plain/reactive 配置）、`readSettings()`（读
-  `accountsDir` / `quotaProbe` / `rotateOnQuotaExhausted` / `strategy`，`rotateOnQuotaExhausted === false`
+  `accountsDir` / `quotaProbe` / `proxyUrl` / `rotateOnQuotaExhausted` / `strategy`，`rotateOnQuotaExhausted === false`
   时把策略降级为 `"sticky"`）。
 - **常量区**：`CLIENT_ID`、`REFRESH_URL`、`REFRESH_WINDOW_MS`、`PROBE_MAX_AGE_MS`（10 分钟）、
   模块级 `refreshInflight`（按文件路径去重）。
 - **传输与令牌**：`requesterFor()`、`refresh()`、`tokenFor()`、`bearerFrom()`、`resolveCodexCredential()`。
-- **池服务**：`createService({ settings, pool })` → `{ resolve, observe, wrapFetch, snapshot, integration, noteAdapterRequest, … }`。
-- **装配**：`anyConfigured()`、`apply()`、`registerQuotaRoute()`。
+- **池服务**：`createService({ settings, pool })` → `{ resolve, observe, wrapFetch, snapshot, integration, noteAdapterRequest, warm, pin, … }`（内部还有 `probeAll()` 与 `probedProxy`，见 [03](./03-api-reference.md#createService-settings-pool)）。
+- **装配**：`anyConfigured()`、`apply()`（创建服务后立刻 `void service.warm()` 后台预热池）、`registerQuotaRoute()`。
 
 详见 [03-api-reference.md](./03-api-reference.md)。
 
@@ -95,12 +95,17 @@ deepseek-harness-codex-auth/
 
 - 常量：`STRATEGIES = ["hybrid","round-robin","sticky"]`、`DEFAULT_STRATEGY = "hybrid"`、
   `DEFAULT_COOLDOWN_MS = 15min`、`TRANSPORT_COOLDOWN_MS = 30s`、`normalizeStrategy()`。
-- `createPool()` / `prunePool()` / `entryState()`：池与账号状态的生命周期。
+- `createPool()` / `prunePool()` / `entryState()`：池与账号状态的生命周期；`prunePool()`
+  同时清掉已消失账号留下的 `sticky` 与 `pinned`。
+- `warmPool(pool, entries)`：给发现的每个账号建立状态条目，让面板在**首个请求之前**就能列出账号
+  —— 只建条目，不选中（不写 `lastUsedAt`）、不造额度读数。
 - `noteToken()` / `accountForToken()`：token ↔ 账号归因（响应观测的前提）。
 - `isAvailable()` / `retryAt()` / `hybridOrder()`：可用性判定与排序
   （`剩余额度百分比 × 健康分` 降序，`lastUsedAt` 破平）。
-- `selectAccount(pool, entries, { now })`：按策略选择；全部不可用时返回最早恢复者，
-  以便上层报出真实的重置时间而不是「池为空」。**自身不做 prune**，避免误删未传入的账号状态。
+- `selectAccount(pool, entries, { now })`：**先看手动固定**（`pool.pinned`，命中且可用即返回），
+  否则按策略选择；全部不可用时返回最早恢复者，以便上层报出真实的重置时间而不是「池为空」。
+  **自身不做 prune**，避免误删未传入的账号状态。
+- `setPinned(pool, id)`：设置/清除手动固定（`null` 或空串即清除），返回生效值。
 - `markUsed()` / `markCooldown()` / `quotaStale()` / `recordQuota()` / `recordOutcome()`：
   状态写入。`recordOutcome` 在 429 时**不扣健康分**（额度窗口已表达限流），只记失败与冷却；
   5xx 健康分 ×0.7 且短冷却；2xx–3xx 健康分回升并清冷却。
@@ -148,11 +153,18 @@ deepseek-harness-codex-auth/
   「多账号额度不可用（当前运行环境未提供 Web 接口）」；
 - 账号列表为空时先看 `snapshot.integration`：`hooked === false && stockAdapter === true`
   说明补丁未生效，显示告警「额度观测未生效：当前 llm-pi-ai 未适配本插件……」；
-  否则提示「尚未观测到账号：发起一次对话后……」（池状态由请求驱动）；
+  否则提示「尚未列出账号：账号目录仍在读取，或未发现任何登录……」。池在插件装配时就已后台预热
+  （见 [`warm()`](./03-api-reference.md#warm)），因此正常情况下列表随设置页打开即出现，
+  这条提示只在预热尚未完成或 `accountsDir` 下确无登录时短暂可见；
 - 每个账号渲染 5 小时 / 本周两条进度条（`--dsw-alias-bg-layer-2` 作轨道，
   `--dsw-alias-state-success/warn/error-primary` 表示 <80% / ≥80% / ≥100%），
   行首为账号 id 与「当前」标记（取 `lastUsedAt` 最大者），行内 meta 为
   「上次使用 N 分钟前 / 尚未使用」及健康状况，尾部是可用性角标与重置倒计时。
+- **手动固定**：行尾按钮「用此账号」/「取消固定」`POST` 同一路由
+  `{ pin: "<id>" | null }`，标题栏在已固定时出现「恢复自动」；`POST` 的响应体就是新的池快照，
+  直接顶替轮询读数，不必等下一个 15 秒。失败显示「切换账号失败，请重试」。
+  固定账号不可用时（`snapshot.pinned` 有值但该账号 `available === false`）额外提示
+  「已临时回退到自动选择」，避免把兜底误读成切换无效。
 
 **`CodexProviderCard`**：组合 `ProxyField` + `QuotaPanel`，并统一做 `openai-codex` 判断。
 
@@ -188,7 +200,10 @@ deepseek-harness-codex-auth/
        rotateOnQuotaExhausted: true
        # accountsDir: "C:/Users/me/.codex/accounts"
    ```
-   —— `accountsDir` 留空即用默认 `$CODEX_HOME/accounts`。
+   —— `accountsDir` 留空即用默认 `$CODEX_HOME/accounts`。`quotaProbe: true` 时，插件除了在
+   交出请求前探测，还会在**启动预热**时（以及首次拿到 `proxyUrl` 后）主动读一次各账号额度，
+   让面板无需等待首个模型请求就能显示用量。provider 走代理时，这里也要填同样的 `proxyUrl`
+   （`# proxyUrl: "http://127.0.0.1:7890"`），否则启动探测只能直连、在需要代理的网络里必然失败。
 
 ---
 
@@ -232,7 +247,7 @@ deepseek-harness-codex-auth/
 
 ## test/ — 单元测试
 
-`npm test` 运行两个文件，共 **11** 个用例（`node:test` + `node:assert/strict`）。
+`npm test` 运行两个文件，共 **17** 个用例（`node:test` + `node:assert/strict`）。
 
 **test/auth.test.js（4 例，认证桥）**
 
@@ -243,7 +258,7 @@ deepseek-harness-codex-auth/
 | `only intercepts the dedicated credential reference` | 非目标引用透传；`dispose()` 还原 `resolve/describe` |
 | `reports the live Codex login as a configured read-only credential` | `describe` 返回 `writable: false` |
 
-**test/pool.test.js（7 例，账号池）**
+**test/pool.test.js（13 例，账号池）**
 
 | 用例 | 验证点 |
 | --- | --- |
@@ -252,11 +267,18 @@ deepseek-harness-codex-auth/
 | quota 响应头归一到两个窗口 | `parseQuota` |
 | hybrid 偏好有余额账号并跳过限流账号 | `selectAccount` |
 | 窗口重置后账号重回轮换 | `expireWindows` + `isAvailable` |
+| 固定账号优先于策略，清除后回到策略 | `setPinned` + `selectAccount` |
+| 固定账号耗尽时让位、窗口重置后回归 | 兜底语义 |
+| 账号消失时固定被丢弃 | `prunePool` 清理 `pinned` |
+| `warmPool` 列出全部账号但不选中 | 预热不写 `lastUsedAt` / 不造额度 |
+| `apply()` 在首个请求前填好池 | 装配时的后台预热 |
 | `apply()` 经池解析、由 `observe` 驱动下次切换 | 端到端打桩 |
 | `wrapFetch` 观测额度且不改响应 | 响应对象原样返回 |
+| 面板经路由固定账号 | `POST /api/codex-pool`（200 / 404 / 405） |
 
 **辅助**：`codexToken(accountId, exp)` 造带 `chatgpt_account_id` 的 JWT，`writePool()` 铺账号目录，
-以及只实现 `get`/`provide` 的假 `ctx`。
+`fakeWebServer()` / `fakeExchange()` 驱动路由，`until()` 等待后台预热等自发异步，以及只实现
+`get`/`provide`/`inject` 的假 `ctx`。
 
 ---
 

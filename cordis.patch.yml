@@ -17,8 +17,15 @@
         # accountsDir: "C:/Users/me/.codex/accounts"
         # hybrid keeps using the account with the most headroom, round-robin
         # cycles evenly, sticky pins one account until its window is spent.
+        # The settings panel can also pin an account by hand at runtime; that
+        # pin outranks the strategy but is never written back here.
         strategy: hybrid
-        # Actively read each account's usage before it is handed a request.
+        # Actively read each account's usage before it is handed a request, and
+        # once at startup so the panel shows usage without a first prompt.
         quotaProbe: false
+        # The same proxy the provider profile uses. The adapter only reveals its
+        # proxy when it resolves a credential, so repeat it here to let the
+        # startup probe go through it too. Optional; omit for a direct install.
+        # proxyUrl: "http://127.0.0.1:7890"
         # false is equivalent to strategy: sticky.
         rotateOnQuotaExhausted: true

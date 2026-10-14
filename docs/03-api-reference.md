@@ -51,9 +51,11 @@ Codex CLI 使用的公开 OAuth 客户端 id，刷新令牌时作为 `client_id`
 #### `configValue(config, key): unknown`
 `config[key]` 既可能是普通值，也可能是 Cordis 的响应式单元；后者带 `get()`，此处统一取值。
 
-#### `readSettings(config): { accountsDir, quotaProbe, rotateOnQuotaExhausted, strategy }`
+#### `readSettings(config): { accountsDir, quotaProbe, proxyUrl, rotateOnQuotaExhausted, strategy }`
 - `rotateOnQuotaExhausted` 默认 `true`，显式 `false` 时等价于 `"sticky"`；
 - `quotaProbe` 默认 `false`，必须显式为 `true` 才开启主动探测；
+- `proxyUrl` 为可选的启动探测代理：适配器只在解析凭据时才把它的代理交出来，而启动探测在此之前
+  就要发请求，因此在代理环境里需在此重复一次（非字符串或空串视为未设置）；
 - `strategy` 经 `normalizeStrategy()` 归一，非法值回落到 `"hybrid"`。
 
 ---
@@ -128,11 +130,14 @@ async resolveCodexCredential({ path = authPath(), now = Date.now(), fetchImpl, p
 | `snapshot(now)` | `poolSnapshot()` 的可序列化视图 |
 | `integration()` | 补丁自检状态 `{ hooked, stockAdapter }`，随 `/api/codex-pool` 下发 |
 | `noteAdapterRequest(withOptions)` | 记录凭据调用是否带 profile options（原版适配器的判据） |
+| `warm()` | 后台预热池：建全量账号条目，`quotaProbe` 打开时顺带主动探测；装配时即调用 |
+| `pin(id)` | 手动固定账号（`null` / `undefined` 即取消）；只作用于之后的请求，不落盘 |
 | `pool` | 池状态本体（诊断用） |
 
 **`resolve({ proxyUrl, now })`**
 
-1. `discoverAccounts()` → `prunePool(pool, ids)`（丢掉已消失的账号）；
+1. `discoverAccounts()` → `prunePool(pool, ids)`（丢掉已消失的账号）→
+   `noteProbeProxy(accounts, proxyUrl)`（`quotaProbe` 打开且代理变化时补一次探测）；
 2. 循环，最多试遍所有账号：
    - 只剩一个候选时直接用它，否则 `selectAccount(pool, remaining, { now })`；
    - `claim()` 成功即返回；
@@ -154,6 +159,34 @@ async resolveCodexCredential({ path = authPath(), now = Date.now(), fetchImpl, p
 `requesterFor(undefined, proxyUrl)` → `probeQuota({ token, accountId: accountIdentity(auth),
 fetchImpl: request, refresh: () => refresh(entry.path, auth, request), now })` → `recordQuota()`；
 `finally` 中 `close()`。整体 try-catch，探测失败不冒泡。
+
+**`warm()`**
+
+装配时后台调用（`apply()` 里 `void service.warm()`），让面板不必等首个模型请求：
+
+1. `discoverAccounts()` → `prunePool()` → `warmPool(pool, accounts)`：把每个账号建成池条目
+   （**只列账号，不选中、不记 `lastUsedAt`、不造额度读数**）；
+2. `settings.quotaProbe === true` 时再 `await probeAll(accounts, settings.proxyUrl)`。
+
+`proxyUrl` 一并传进去，是因为适配器要到解析凭据时才交出它的代理，而这一步在首个请求之前就要发
+网络请求；代理环境里不填 `proxyUrl`，探测只能直连、必然失败。
+
+没有它时 `pool.accounts` 只在 `resolve()` 内被填充，重启后池为空，面板要等第一次对话才显示账号。
+
+**`probeAll(accounts, proxyUrl)`**
+
+`Promise.all` 遍历账号，跳过 `quotaStale(pool, id, PROBE_MAX_AGE_MS, now) === false` 的（读数仍新鲜），
+其余逐个 `tokenFor()` + `probeAccount()`；单个账号失败只吞掉自己的错误，不影响其它账号，也不冒泡。
+探测**复用同一 `proxyUrl`**，与令牌刷新、模型请求同一出口。
+
+**`probedProxy` / `noteProbeProxy(accounts, proxyUrl)`**
+
+启动时拿不到 provider 的 `proxyUrl`（它只在 `credentials.resolve(ref, { proxyUrl })` 的参数里出现），
+而代理环境下不设代理就访问不到 `chatgpt.com`。因此 `probedProxy` **以插件配置的 `proxyUrl` 起头**
+（未配置则为 `null`，即直连那一轮）；首个携带 `proxyUrl` 的 `resolve()` 一旦发现 key 变化，就对
+**仍无新鲜读数**的账号再探一次（`Promise.all` 并行）——覆盖「provider 改了代理」的情形。
+代价是已被 `claim()` 探测过的账号可能多一次只读 GET。`settings.quotaProbe` 为假时
+`noteProbeProxy()` 直接返回，完全不做这些事。
 
 **`observe({ token, authorization, status, headers, now })`**
 
@@ -190,6 +223,18 @@ function wrapFetch(baseFetch) {
 最便宜的判据。`withOptions` 为假时置 `integration.stockAdapter = true`。
 
 它由 `apply()` 里的 `resolve(ref, options)` 包装调用，因此**不依赖任何文件路径猜测**。
+
+#### `pin(id)`
+把账号的选择权从策略手里拿走，或还回去。转发给 `setPinned(pool, id)`，返回当前生效的固定 id。
+
+语义三连：
+
+- **优先级最高**：固定账号可用时，`selectAccount()` 直接返回它，`strategy` 不再参与；
+- **兜底而非硬钉**：固定账号耗尽或冷却时让位给 `strategy`（面板提示「已临时回退」），
+  它的窗口一重置就自动回来 —— 否则错误配置会变成一串 429；
+- **不落盘**：与池状态一样活在进程内，重启后回到 `strategy`。
+
+只有 `POST /api/codex-pool` 会调用它，因此固定只能选池里已有状态的账号（未知 id 由路由返回 404）。
 
 #### `integration()`
 返回 `{ hooked, stockAdapter }` 快照，随 `/api/codex-pool` 一并下发，供面板判读：
@@ -231,8 +276,15 @@ function wrapFetch(baseFetch) {
 `webServer.register({ kind: "exact", path: QUOTA_ROUTE, handler })`：
 
 - `GET` → `200` + `service.snapshot()` 并附 `integration` 字段（补丁自检状态）的 JSON；
+- `POST` → 读 `{ pin: "<id>" | null }`，调 `service.pin()`，同样返回**变更后**的快照
+  （面板因此不必再等一轮轮询）。`pin` 不是字符串或为 `null` 以外的类型 → `400`；
+  未知账号 → `404`；请求体不是 JSON 或超过 4 KiB → `400`；
 - 其它方法 → `405` + `{ error: "method not allowed" }`；
 - 统一带 `cache-control: no-store`。**响应体里没有任何 token 或账号凭据**。
+
+`POST` 的 body 是异步到达的，`applyPin()` 的失败一律收敛为 `500`，不会变成宿主请求循环里的
+未处理 rejection。该路由与 `GET` 一样同源、无鉴权 —— 与 [01-architecture.md](./01-architecture.md#6-边界与不支持项)
+里的「本机可信插件」前提一致。
 
 ---
 
@@ -280,8 +332,10 @@ function wrapFetch(baseFetch) {
 | `STRATEGIES` / `DEFAULT_STRATEGY` | `["hybrid","round-robin","sticky"]` / `"hybrid"` |
 | `DEFAULT_COOLDOWN_MS` / `TRANSPORT_COOLDOWN_MS` | 15 分钟 / 30 秒 |
 | `normalizeStrategy(value)` | 非法值回落 `"hybrid"` |
-| `createPool({ strategy, accountsDir })` | 池：`accounts` Map、`tokens` Map、`cursor`、`sticky` |
-| `prunePool(pool, ids)` | 丢弃不在 `ids` 中的账号状态（并清掉失效的 sticky） |
+| `createPool({ strategy, accountsDir })` | 池：`accounts` Map、`tokens` Map、`cursor`、`sticky`、`pinned` |
+| `setPinned(pool, id)` | 设置 / 清除手动固定（`null`、空串即清除），返回生效值 |
+| `prunePool(pool, ids)` | 丢弃不在 `ids` 中的账号状态（并清掉失效的 sticky / `pinned`） |
+| `warmPool(pool, entries)` | 为发现到的每个账号建状态条目（预热）：只列账号，不选中、不记使用、不造额度 |
 | `noteToken` / `accountForToken` | token ↔ 账号归因 |
 | `isAvailable(state, now)` | 冷却已过且未耗尽 |
 | `retryAt(state, now)` | 冷却与额度重置中较晚者 |
@@ -294,6 +348,8 @@ function wrapFetch(baseFetch) {
 
 **`selectAccount` 的策略**
 
+0. **手动固定**：`pool.pinned` 命中且该账号可用 → 直接返回（`strategy` 不参与）；
+   命中但不可用 → 落到下面的策略，**不清除** `pool.pinned`，等它恢复后自动回来；
 1. 用 `hybridOrder()` 排序：`剩余额度百分比 × 健康分` 降序，`lastUsedAt` 破平；
 2. `round-robin`：在可用者中按 `cursor` 轮流；
 3. `sticky`：优先保留当前 `pool.sticky`；
@@ -320,6 +376,7 @@ function wrapFetch(baseFetch) {
 {
   "strategy": "hybrid",
   "accountsDir": "C:\\Users\\me\\.codex\\accounts",
+  "pinned": "work",
   "observedAt": 1760000000000,
   "accounts": [
     {
@@ -373,12 +430,18 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 轮询 hook。挂载时立即 `fetch(QUOTA_ROUTE)`，随后每 `POLL_INTERVAL_MS` 一次；
 失败时保留上一次的 `snapshot`，只把 `status` 置为 `"offline"`；
 卸载时 `clearInterval` 并置 `live = false` 丢弃迟到的响应。
+返回值在 `{ status, snapshot }` 之外还带一个 `apply(snapshot)`：`POST` 的响应体本身就是新的池快照，
+用它直接顶替读数，于是切换立刻可见，不必等下一个轮询周期。
 
 ### `QuotaPanel({ provider })`
 - 同样只作用于 `openai-codex`；
 - 标题显示策略名（`多账号额度 · 智能选择`）；
 - 角标：`"读取中"` / `"已断开，显示最后一次读数"` / `"15 秒自动刷新"`；
 - `currentId`：取 `lastUsedAt` 最大的账号，作为「当前」标记传给 `AccountRow`；
+- `pinned` / `pinnedAccount`：来自 `snapshot.pinned`；已固定时标题栏出现「恢复自动」，
+  `pinFallingBack`（固定账号不在列表或 `available === false`）时提示「已临时回退到自动选择」；
+- `switchTo(id)`：`POST { pin: id | null }`，成功用响应体 `apply()`，失败置 `pinState = "failed"`
+  并显示「切换账号失败，请重试」；
 - 从未拿到快照 → 「多账号额度不可用（当前运行环境未提供 Web 接口）」；
 - `unpatched`（`snapshot.integration.hooked === false && snapshot.integration.stockAdapter === true`）
   → 告警「额度观测未生效：当前 llm-pi-ai 未适配本插件……」，优先级高于「空列表」提示；
@@ -389,13 +452,13 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 把时间戳渲染成相对文案：前者「刚刚 / N 分钟前 / N 小时前 / N 天前」（用于「上次使用」），
 后者「N 分钟后重置 / N 小时后重置 / N 天后重置」。
 
-### `Meter({ label, usedPercent, resetAt, now })` / `AccountRow({ account, now, isCurrent })`
+### `Meter({ label, usedPercent, resetAt, now })` / `AccountRow({ account, now, isCurrent, isPinned, busy, onTogglePin })`
 用量进度条与账号行：5 小时 / 本周两条，轨道用 `--dsw-alias-bg-layer-2`，
 填充色按使用率取 `--dsw-alias-state-success-primary`（<80%）/
 `--dsw-alias-state-warn-primary`（≥80%）/ `--dsw-alias-state-error-primary`（≥100%）；
-未观测到读数时显示「暂无数据」。`AccountRow` 首行为账号 id 加条件渲染的「当前」标记，
+未观测到读数时显示「暂无数据」。`AccountRow` 首行为账号 id 加条件渲染的「当前」/「已固定」标记，
 次行为「上次使用 …／尚未使用」与健康状况（`health < 0.95` 时显示），尾部角标显示
-可用 / 冷却中 / 额度耗尽。
+可用 / 冷却中 / 额度耗尽，以及手动固定按钮（「用此账号」↔「取消固定」，`busy` 期间禁用）。
 
 ### `CodexProviderCard(props)`
 组合 `ProxyField` + `QuotaPanel`，统一做 `provider.provider === "openai-codex"` 判断。
@@ -418,7 +481,8 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 | --- | --- | --- | --- |
 | `accountsDir` | `string` | `$CODEX_HOME/accounts` | 账号目录 |
 | `strategy` | `"hybrid" \| "round-robin" \| "sticky"` | `"hybrid"` | 选择策略，非法值回落 `hybrid` |
-| `quotaProbe` | `boolean` | `false` | 是否在请求前主动探测额度 |
+| `quotaProbe` | `boolean` | `false` | 是否在请求前、以及启动预热时主动探测额度 |
+| `proxyUrl` | `string` | 直连 | 启动探测所用的代理（与 provider 的 `proxyUrl` 相同）；代理环境里必填 |
 | `rotateOnQuotaExhausted` | `boolean` | `true` | `false` 等价于 `strategy: "sticky"` |
 
 ## 环境变量汇总

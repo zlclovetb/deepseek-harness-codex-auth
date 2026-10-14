@@ -25,7 +25,9 @@ DeepSeek Harness 插件：让官方 `llm-pi-ai` 适配器直接复用 **Codex CL
 - **核心机制**：拦截名为 `OPENAI_CODEX_AUTH` 的**单条**凭据引用，改为实时读取
   `$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`），必要时按 Codex CLI 协议刷新并原子写回。
 - **账号池**：`$CODEX_HOME/accounts/<name>/auth.json` 存在时按多个账号轮换；额度取自响应头，
-  亦可选主动探测。无该目录时回退到单账号，行为与旧版一致。
+  亦可选主动探测；插件**启动即后台预热**，面板无需先对话即可列出账号（`quotaProbe: true` 时
+  连额度也一并预先探测，此时若 provider 走代理，插件配置里也要填同样的 `proxyUrl`），面板里还可
+  手动固定某个账号（兜底式、仅进程内）。无该目录时回退到单账号，行为与旧版一致。
 - **依赖**：仅一个运行时依赖 `undici`；其余能力（`credentials` / `slots` / `configForms` /
   `webServer`）由宿主 DeepSeek Harness 注入。
 
@@ -37,6 +39,9 @@ DeepSeek Harness 插件：让官方 `llm-pi-ai` 适配器直接复用 **Codex CL
 | `apply(ctx)` 如何打桩 `credentials` | [03-api-reference.md](./03-api-reference.md#applyctx-config) |
 | 多账号怎么发现、怎么挑、额度怎么记 | [03-api-reference.md](./03-api-reference.md#lib-账号池) |
 | 「额度面板」的数据从哪来 | [03-api-reference.md](./03-api-reference.md#quotapanelprovider) |
+| 怎么手动指定用哪个 Codex 账号 | [05-usage.md](./05-usage.md#46-手动切换账号) · [03-api-reference.md](./03-api-reference.md#pinid) |
+| 重启后账号/额度多久出现（启动预热） | [03-api-reference.md](./03-api-reference.md#warm) · [05-usage.md](./05-usage.md#45-查看多账号额度) |
+| 开了 `quotaProbe` 额度还是不更新 | [05-usage.md](./05-usage.md#8-故障排查)（多半是没给插件配置填 `proxyUrl`） |
 | `cordis.patch.yml` 如何注册路由与桥接 | [02-modules.md](./02-modules.md#cordispatchyml--bundle-patch) |
 | 设置页“网络代理”输入框怎么来的 | [02-modules.md](./02-modules.md#clientjs--浏览器端模块) |
 | `proxyUrl` 补丁改了官方包的哪些地方 | [04-dependencies.md](./04-dependencies.md#5-补丁patch详解) |

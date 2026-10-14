@@ -62,7 +62,7 @@ deepseek-harness-codex-auth
 | `llm-pi-ai`（官方适配器） | **保留并扩展** | patch 只 `config.providers` 增加 `openai-codex`，不替换实现；同时 `insert` 本插件 |
 | `credentials.resolve` | **包装替换** | 目标引用走账号池逻辑，其余透传；dispose 时还原 |
 | `credentials.describe` | **包装替换** | 目标引用报告 `codex-cli` 只读状态；字段集合不变 |
-| `webServer` 路由表 | **新增路由** | 注册精确路径 `/api/codex-pool`（GET 返回池快照 JSON） |
+| `webServer` 路由表 | **新增路由** | 注册精确路径 `/api/codex-pool`（`GET` 返回池快照 JSON，`POST` 手动固定账号） |
 | `codexMultiAuth` 服务 | **新增服务** | `ctx.provide()` 暴露池观测层，供补丁后的适配器 `ctx.get()` 查找 |
 
 ## 5. 补丁（patch）详解
@@ -173,9 +173,16 @@ lockfile 的 `patch_hash` 记录其内容；`pnpm install` 与 `dsh plugin add` 
   → `recordOutcome()` 合并 `x-codex-*` 响应头。
 - **额度观测链路（主动）**：`claim()` → `probeAccount()` →（同一 `ProxyAgent`）→
   `chatgpt.com/backend-api/wham/usage` → `recordQuota()`。
+- **启动预热链路**：`apply()` → `void service.warm()` → `discoverAccounts()` → `warmPool()`
+  （立即列出账号，无需模型请求）→ `quotaProbe` 打开时 `probeAll(accounts, settings.proxyUrl)`
+  →（配置了 `proxyUrl` 则同一 `ProxyAgent`，否则直连）→ `recordQuota()`；
+  若 provider 的代理与此不同，首个 `resolve()` 会经 `noteProbeProxy()` 对未测得账号补探一次。
 - **配置/UI 链路**：DSH 设置页 → `configForms("llm-pi-ai")` → `client.js`
   → `ProxyField` 写 `providers["openai-codex"].proxyUrl`（被补丁后的 `llm-pi-ai` 读取并生效）
   ／ `QuotaPanel` 读同源 `GET /api/codex-pool`（由 `webServer` 路由返回池快照）。
+- **手动固定链路**：面板按钮 → `POST /api/codex-pool { pin }` → `service.pin()` →
+  `setPinned(pool, id)` → 下一次 `selectAccount()` 优先返回被固定账号 → 响应体（新快照）回到面板。
+  只改 `pool.pinned`，不碰配置、不落盘、不经过补丁。
 - **补丁自检链路**：补丁 → `profileFetch` → `service.wrapFetch()` → `integration.hooked`；
   原版适配器 → `credentials.resolve(ref)`（不带 options）→ `integration.stockAdapter`。
   两者随 `GET /api/codex-pool` 下发，面板据此区分「还没请求过」与「补丁没生效」。

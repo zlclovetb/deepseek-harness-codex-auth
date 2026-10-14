@@ -23,7 +23,9 @@ import {
   quotaStale,
   recordOutcome,
   recordQuota,
-  selectAccount
+  selectAccount,
+  setPinned,
+  warmPool
 } from "./lib/rotation.js";
 import { probeQuota } from "./lib/probe.js";
 
@@ -53,9 +55,14 @@ function configValue(config, key) {
 
 function readSettings(config) {
   const rotate = configValue(config, "rotateOnQuotaExhausted") !== false;
+  const proxyUrl = configValue(config, "proxyUrl");
   return {
     accountsDir: configValue(config, "accountsDir"),
     quotaProbe: configValue(config, "quotaProbe") === true,
+    // The adapter's per-provider proxy is only visible once it resolves a
+    // credential, which is too late for the startup probe. This lets a proxied
+    // install name its transport up front; the adapter's value still wins later.
+    proxyUrl: typeof proxyUrl === "string" && proxyUrl !== "" ? proxyUrl : undefined,
     rotateOnQuotaExhausted: rotate,
     // Staying on one account is exactly the sticky strategy.
     strategy: rotate ? normalizeStrategy(configValue(config, "strategy")) : "sticky"
@@ -171,6 +178,7 @@ function createService({ settings, pool }) {
   async function resolve({ proxyUrl, now = Date.now() } = {}) {
     const { accounts } = await discoverAccounts({ accountsDir: settings.accountsDir });
     prunePool(pool, accounts.map((entry) => entry.id));
+    noteProbeProxy(accounts, proxyUrl);
     const tried = new Set();
     let lastError;
     while (tried.size < accounts.length) {
@@ -223,6 +231,57 @@ function createService({ settings, pool }) {
     }
   }
 
+  /**
+   * The proxy the current probe pass used. Seeded from the plugin's own
+   * `proxyUrl`, because the adapter hands its proxy over only when it resolves a
+   * credential — too late for the startup pass. `null` is that direct pass; a
+   * later `resolve()` that reveals a different proxy re-probes the accounts the
+   * startup pass could not reach.
+   */
+  let probedProxy = settings.proxyUrl ?? null;
+
+  function noteProbeProxy(accounts, proxyUrl) {
+    if (!settings.quotaProbe) return;
+    const key = proxyUrl ?? null;
+    if (key === probedProxy) return;
+    probedProxy = key;
+    void probeAll(accounts, proxyUrl).catch(() => {});
+  }
+
+  /**
+   * Read every account that has no fresh reading, all at once. Detached from the
+   * request that triggered it and best-effort per account: an account that cannot
+   * be reached, read or refreshed simply stays unmeasured until its own reply is
+   * observed.
+   */
+  async function probeAll(accounts, proxyUrl) {
+    const now = Date.now();
+    await Promise.all(accounts.map(async (entry) => {
+      if (quotaStale(pool, entry.id, PROBE_MAX_AGE_MS, now) === false) return;
+      try {
+        const { token, auth } = await tokenFor(entry.path, { now, fetchImpl: undefined, proxyUrl });
+        await probeAccount(entry, { token, auth, proxyUrl, now });
+      } catch {
+        // Unreachable, unreadable or unrefreshable: left to the passive path.
+      }
+    }));
+  }
+
+  /**
+   * Fill the pool before the first model request.
+   *
+   * Without this the panel stays blank until someone talks to the model, because
+   * `pool.accounts` is only populated while a credential is being resolved.
+   * Accounts are listed immediately; their quota is only read up front when
+   * `quotaProbe` is on, since that is a real network call per account.
+   */
+  async function warm() {
+    const { accounts } = await discoverAccounts({ accountsDir: settings.accountsDir });
+    prunePool(pool, accounts.map((entry) => entry.id));
+    warmPool(pool, accounts);
+    if (settings.quotaProbe) await probeAll(accounts, settings.proxyUrl);
+  }
+
   /** Attribute one already-sent response to its account. */
   function observe({ token, authorization, status, headers, now = Date.now() } = {}) {
     try {
@@ -243,6 +302,18 @@ function createService({ settings, pool }) {
    */
   function noteAdapterRequest(withOptions) {
     if (!withOptions) integration.stockAdapter = true;
+  }
+
+  /**
+   * Take the choice of account away from the strategy, or give it back.
+   *
+   * Deliberately not persisted: the pin lives exactly as long as the pool does,
+   * which keeps a restart a clean return to automatic selection. A pinned
+   * account that is spent or cooling is skipped like any other, and the pin
+   * takes over again by itself once its window resets.
+   */
+  function pin(id) {
+    return setPinned(pool, id);
   }
 
   /**
@@ -274,6 +345,8 @@ function createService({ settings, pool }) {
     snapshot: (now = Date.now()) => poolSnapshot(pool, now),
     integration: () => ({ ...integration }),
     noteAdapterRequest,
+    warm,
+    pin,
     pool
   };
 }
@@ -296,6 +369,9 @@ export function apply(ctx, config) {
   const settings = readSettings(config);
   const pool = createPool({ strategy: settings.strategy, accountsDir: settings.accountsDir });
   const service = createService({ settings, pool });
+  // Fill the pool in the background so the settings panel can list the accounts
+  // right after a restart instead of waiting for the first model request.
+  void service.warm().catch(() => {});
   const credentials = ctx.get("credentials");
   const originalResolve = credentials.resolve;
   const originalDescribe = credentials.describe;
@@ -333,20 +409,71 @@ export function apply(ctx, config) {
 /** The exact path the settings card polls for live pool state. */
 export const QUOTA_ROUTE = "/api/codex-pool";
 
+/** A pin request carries one account id, so anything larger is malformed. */
+const MAX_PIN_BODY_BYTES = 4 * 1024;
+
+/** Answer with JSON and never let a cached pool reading go stale in a proxy. */
+function sendJson(response, status, payload) {
+  response.writeHead(status, {
+    "content-type": "application/json; charset=utf-8",
+    "cache-control": "no-store"
+  });
+  response.end(JSON.stringify(payload));
+}
+
+async function readJsonBody(request) {
+  let raw = "";
+  for await (const chunk of request) {
+    raw += chunk;
+    if (raw.length > MAX_PIN_BODY_BYTES) throw new Error("pin body is too large");
+  }
+  const trimmed = raw.trim();
+  return trimmed === "" ? {} : JSON.parse(trimmed);
+}
+
+/**
+ * Apply `{ pin: "<id>" | null }` from the settings panel and answer with the
+ * pool as it now stands, so the caller can render the result without a second
+ * round trip.
+ */
+async function applyPin(request, response, service) {
+  let body;
+  try {
+    body = await readJsonBody(request);
+  } catch {
+    return sendJson(response, 400, { error: "invalid JSON body" });
+  }
+  const requested = body?.pin;
+  if (requested !== null && requested !== undefined && (typeof requested !== "string" || requested === "")) {
+    return sendJson(response, 400, { error: "pin must be an account id or null" });
+  }
+  if (typeof requested === "string" && service.pool.accounts.has(requested) === false) {
+    return sendJson(response, 404, { error: `unknown account: ${requested}` });
+  }
+  service.pin(requested ?? undefined);
+  return sendJson(response, 200, { ...service.snapshot(), integration: service.integration?.() });
+}
+
 /** Serve the pool snapshot as JSON; no secret ever crosses this route. */
 function registerQuotaRoute(webServer, service) {
+  const snapshotPayload = () => ({ ...service.snapshot(), integration: service.integration?.() });
   return webServer.register({
     kind: "exact",
     path: QUOTA_ROUTE,
     handler: (request, response) => {
-      const payload = JSON.stringify(request.method === "GET"
-        ? { ...service.snapshot(), integration: service.integration?.() }
-        : { error: "method not allowed" });
-      response.writeHead(request.method === "GET" ? 200 : 405, {
-        "content-type": "application/json; charset=utf-8",
-        "cache-control": "no-store"
-      });
-      response.end(payload);
+      if (request.method === "GET") {
+        sendJson(response, 200, snapshotPayload());
+        return;
+      }
+      if (request.method === "POST") {
+        // The body arrives asynchronously; a failure here must still produce a
+        // reply rather than an unhandled rejection in the host's request loop.
+        applyPin(request, response, service).catch(() => {
+          if (response.headersSent !== true) sendJson(response, 500, { error: "pin failed" });
+        });
+        return;
+      }
+      sendJson(response, 405, { error: "method not allowed" });
     }
   });
 }
