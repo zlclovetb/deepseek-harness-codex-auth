@@ -7,7 +7,21 @@ import { tmpdir } from "node:os";
 import { apply, CODEX_CREDENTIAL_REF } from "../index.js";
 import { discoverAccounts, accountIdentity } from "../lib/accounts.js";
 import { parseQuota, isQuotaExhausted, quotaRetryAt } from "../lib/quota.js";
-import { createPool, prunePool, recordOutcome, selectAccount, setPinned, warmPool, poolSnapshot } from "../lib/rotation.js";
+import { USAGE_URL, SUBSCRIPTIONS_URL, readQuota } from "../lib/probe.js";
+import {
+  createPool,
+  earliestQuotaDueAt,
+  markProbeFailure,
+  prunePool,
+  quotaStale,
+  recordOutcome,
+  recordQuota,
+  resetProbeAttempts,
+  selectAccount,
+  setPinned,
+  warmPool,
+  poolSnapshot
+} from "../lib/rotation.js";
 
 function jwt(payload, exp) {
   return `x.${Buffer.from(JSON.stringify({ exp, ...payload })).toString("base64url")}.x`;
@@ -59,6 +73,77 @@ test("quota headers normalize into the two windows", () => {
   assert.equal(quota.secondaryUsedPercent, 100);
   assert.equal(isQuotaExhausted(quota), true);
   assert.ok(quotaRetryAt(quota) > now);
+});
+
+test("readQuota prefers the subscription endpoint and keeps its renewal cadence", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url, init });
+    return new Response(JSON.stringify({
+      plan_type: "plus",
+      rate_limit: {
+        primary_window: { used_percent: 19, limit_window_seconds: 18000, reset_after_seconds: 17603 },
+        secondary_window: { used_percent: 34, limit_window_seconds: 604800, reset_after_seconds: 542613 }
+      },
+      renewal_seconds: 1800
+    }), { status: 200 });
+  };
+  const now = Date.now();
+  const quota = await readQuota({ token: "access", accountId: "acct-a", fetchImpl, now });
+
+  assert.deepEqual(calls.map((call) => call.url), [SUBSCRIPTIONS_URL]);
+  assert.equal(calls[0].init.method, "POST");
+  assert.equal(calls[0].init.headers.authorization, "Bearer access");
+  assert.equal(calls[0].init.headers["chatgpt-account-id"], "acct-a");
+  assert.equal(calls[0].init.headers["OAI-App-Brand"], "codex");
+  assert.equal(quota.primaryUsedPercent, 19);
+  assert.equal(quota.primaryWindowMinutes, 300);
+  assert.equal(quota.secondaryUsedPercent, 34);
+  assert.equal(quota.renewalSeconds, 1800);
+});
+
+test("readQuota falls back to a pull, which carries no renewal cadence", async () => {
+  const urls = [];
+  const fetchImpl = async (url) => {
+    urls.push(url);
+    if (url === SUBSCRIPTIONS_URL) return new Response("nope", { status: 500 });
+    return new Response(JSON.stringify({
+      rate_limit: { primary_window: { used_percent: 7, limit_window_seconds: 18000 } }
+    }), { status: 200 });
+  };
+  const quota = await readQuota({ token: "access", accountId: "acct-a", fetchImpl });
+
+  assert.deepEqual(urls, [SUBSCRIPTIONS_URL, USAGE_URL]);
+  assert.equal(quota.primaryUsedPercent, 7);
+  assert.equal(quota.renewalSeconds, undefined);
+});
+
+test("a server-named lease keeps a reading fresh past the caller's bound", () => {
+  const pool = createPool({ strategy: "hybrid" });
+  const now = Date.now();
+  const later = now + 20 * 60 * 1000;
+
+  recordQuota(pool, "alpha", { observedAt: now, primaryUsedPercent: 5, renewalSeconds: 1800 }, now);
+  assert.equal(quotaStale(pool, "alpha", 10 * 60 * 1000, later), false);
+
+  // No lease in the reading, so the caller's bound still decides.
+  recordQuota(pool, "bravo", { observedAt: now, primaryUsedPercent: 5 }, now);
+  assert.equal(quotaStale(pool, "bravo", 10 * 60 * 1000, later), true);
+});
+
+test("earliestQuotaDueAt names the pool's first expiring reading", () => {
+  const empty = createPool({ strategy: "hybrid" });
+  assert.equal(earliestQuotaDueAt(empty, 10 * 60 * 1000, 1000), undefined);
+
+  const pool = createPool({ strategy: "hybrid" });
+  const now = 1_000_000;
+  warmPool(pool, [{ id: "alpha" }, { id: "bravo" }]);
+  // Nothing read yet: each account is due at the current instant.
+  assert.equal(earliestQuotaDueAt(pool, 10 * 60 * 1000, now), now);
+
+  recordQuota(pool, "alpha", { observedAt: now, primaryUsedPercent: 1, renewalSeconds: 900 }, now);
+  recordQuota(pool, "bravo", { observedAt: now, primaryUsedPercent: 1, renewalSeconds: 1800 }, now);
+  assert.equal(earliestQuotaDueAt(pool, 10 * 60 * 1000, now), now + 900_000);
 });
 
 test("hybrid selection prefers the account with headroom and skips a limited one", async () => {
@@ -305,4 +390,99 @@ test("the settings panel pins an account over the pool route", async () => {
   } finally {
     dispose();
   }
+});
+
+test("opening the panel re-reads the pool without disturbing the pin", async () => {
+  const dir = await writePool({ alpha: "acct-a", bravo: "acct-b" });
+  const services = {};
+  const credentials = { resolve: async () => undefined, describe: async () => ({ configured: false }) };
+  const web = fakeWebServer();
+  const ctx = {
+    get: () => credentials,
+    provide: (nameValue, service) => { services[nameValue] = service; return () => {}; },
+    inject: (names, callback) => { callback({ webServer: web }); return () => {}; }
+  };
+  const dispose = apply(ctx, { accountsDir: dir });
+  try {
+    const route = web.routes[0];
+    // Resolving once is what fills the pool; the route only accepts known ids.
+    await credentials.resolve(CODEX_CREDENTIAL_REF);
+    const pin = fakeExchange("POST", JSON.stringify({ pin: "bravo" }));
+    route.handler(pin.request, pin.response);
+    await settled(pin.response);
+    assert.equal(JSON.parse(pin.response.payload).pinned, "bravo");
+
+    // A refresh must answer with the accounts, and must not read as an unpin.
+    const refresh = fakeExchange("POST", JSON.stringify({ refresh: true }));
+    route.handler(refresh.request, refresh.response);
+    assert.equal(await until(() => refresh.response.payload !== undefined), true);
+    assert.equal(refresh.response.status, 200);
+    const state = JSON.parse(refresh.response.payload);
+    assert.equal(state.pinned, "bravo");
+    assert.deepEqual(state.accounts.map((entry) => entry.id), ["alpha", "bravo"]);
+  } finally {
+    dispose();
+  }
+});
+
+test("a failed probe doubles its wait instead of retrying every minute", () => {
+  const pool = createPool({ strategy: "hybrid" });
+  warmPool(pool, [{ id: "alpha" }]);
+  const now = 1_700_000_000_000;
+
+  // The account has no reading yet, so its own backoff is the only thing standing
+  // between the scheduler and its floor.
+  markProbeFailure(pool, "alpha", now);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), now + 60_000);
+
+  markProbeFailure(pool, "alpha", now);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), now + 120_000);
+
+  markProbeFailure(pool, "alpha", now);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), now + 240_000);
+});
+
+test("an account stops being retried once its attempts are used up", () => {
+  const pool = createPool({ strategy: "hybrid" });
+  warmPool(pool, [{ id: "alpha" }]);
+  const now = 1_700_000_000_000;
+  // The first attempt plus three retries; the fourth failure ends the round.
+  for (let attempt = 0; attempt < 4; attempt += 1) markProbeFailure(pool, "alpha", now);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), undefined);
+  // Not stale either, so a claimed credential cannot restart a round that gave up.
+  assert.equal(quotaStale(pool, "alpha", 600_000, now), false);
+});
+
+test("opening the panel hands the attempts back", () => {
+  const pool = createPool({ strategy: "hybrid" });
+  warmPool(pool, [{ id: "alpha" }]);
+  const now = 1_700_000_000_000;
+  for (let attempt = 0; attempt < 4; attempt += 1) markProbeFailure(pool, "alpha", now);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), undefined);
+
+  resetProbeAttempts(pool);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), now);
+  assert.equal(quotaStale(pool, "alpha", 600_000, now), true);
+});
+
+test("a reading or a passive reply clears the spent attempts", () => {
+  const pool = createPool({ strategy: "hybrid" });
+  warmPool(pool, [{ id: "alpha" }]);
+  const now = 1_700_000_000_000;
+  const spendAttempts = () => {
+    for (let attempt = 0; attempt < 4; attempt += 1) markProbeFailure(pool, "alpha", now);
+  };
+
+  spendAttempts();
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), undefined);
+
+  // A reading clears the counter, and its own lease then sets the next wait.
+  recordQuota(pool, "alpha", { observedAt: now, primaryUsedPercent: 10, renewalSeconds: 600 }, now);
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), now + 600_000);
+
+  // A passive reply proves reachability just as well as a probe does.
+  spendAttempts();
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), undefined);
+  recordOutcome(pool, "alpha", { status: 200, now });
+  assert.equal(earliestQuotaDueAt(pool, 600_000, now), now + 600_000);
 });

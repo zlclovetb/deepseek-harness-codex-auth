@@ -83,7 +83,27 @@ window.__ModuleLoader__.load({
             if (live) setState((previous) => ({ status: "offline", snapshot: previous.snapshot }))
           }
         }
+        /**
+         * Opening the panel is the refresh trigger: ask the host to re-read the
+         * accounts now rather than waiting out the poll or the next model request,
+         * so the numbers shown are the ones this panel was opened to see.
+         */
+        async function refresh() {
+          try {
+            const response = await fetch(QUOTA_ROUTE, {
+              method: "POST",
+              headers: { "content-type": "application/json", accept: "application/json" },
+              body: JSON.stringify({ refresh: true })
+            })
+            if (!response.ok) throw new Error(String(response.status))
+            const snapshot = await response.json()
+            if (live) setState({ status: "ready", snapshot })
+          } catch {
+            // A refresh that cannot run never blanks a panel that already has data.
+          }
+        }
         load()
+        refresh()
         timer = setInterval(load, POLL_INTERVAL_MS)
         return () => {
           live = false

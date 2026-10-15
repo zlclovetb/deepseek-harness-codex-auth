@@ -14,7 +14,9 @@ import {
   DEFAULT_STRATEGY,
   accountForToken,
   createPool,
+  earliestQuotaDueAt,
   markCooldown,
+  markProbeFailure,
   markUsed,
   normalizeStrategy,
   noteToken,
@@ -23,11 +25,12 @@ import {
   quotaStale,
   recordOutcome,
   recordQuota,
+  resetProbeAttempts,
   selectAccount,
   setPinned,
   warmPool
 } from "./lib/rotation.js";
-import { probeQuota } from "./lib/probe.js";
+import { readQuota } from "./lib/probe.js";
 
 export const name = "codex-cli-auth";
 export const inject = ["credentials"];
@@ -40,6 +43,10 @@ const REFRESH_URL = "https://auth.openai.com/oauth/token";
 const REFRESH_WINDOW_MS = 5 * 60 * 1000;
 /** How long an active probe's reading is trusted before another one is worth spending. */
 const PROBE_MAX_AGE_MS = 10 * 60 * 1000;
+/** Never re-subscribe sooner than this, so a short server cadence cannot become a hot loop. */
+const PROBE_MIN_WAIT_MS = 60 * 1000;
+/** The pool's single re-subscribe timer; unref'd so it never keeps the process alive. */
+let leaseTimer;
 /** One in-flight refresh per auth file, so concurrent requests share the rotation. */
 const refreshInflight = new Map();
 
@@ -216,18 +223,22 @@ function createService({ settings, pool }) {
   async function probeAccount(entry, { token, auth, proxyUrl, now }) {
     const { request, close } = requesterFor(undefined, proxyUrl);
     try {
-      const quota = await probeQuota({
+      const quota = await readQuota({
         token,
         accountId: accountIdentity(auth),
         fetchImpl: request,
         refresh: () => refresh(entry.path, auth, request),
         now
       });
-      recordQuota(pool, entry.id, quota, now);
+      if (quota === undefined) markProbeFailure(pool, entry.id, now);
+      else recordQuota(pool, entry.id, quota, now);
     } catch {
-      // A probe that cannot answer leaves the passive header path in charge.
+      // Unreadable or unreachable: the account waits out its own backoff before
+      // the next attempt, and the passive header path stays in charge meanwhile.
+      markProbeFailure(pool, entry.id, now);
     } finally {
       await close?.();
+      scheduleLease();
     }
   }
 
@@ -249,15 +260,16 @@ function createService({ settings, pool }) {
   }
 
   /**
-   * Read every account that has no fresh reading, all at once. Detached from the
-   * request that triggered it and best-effort per account: an account that cannot
-   * be reached, read or refreshed simply stays unmeasured until its own reply is
-   * observed.
+   * Read the accounts, all at once. Detached from the request that triggered it
+   * and best-effort per account: an account that cannot be reached, read or
+   * refreshed simply stays unmeasured until its own reply is observed. A pass
+   * only spends a request on an account whose reading is already stale, unless
+   * `force` asks for today's numbers regardless of age.
    */
-  async function probeAll(accounts, proxyUrl) {
+  async function probeAll(accounts, proxyUrl, { force = false } = {}) {
     const now = Date.now();
     await Promise.all(accounts.map(async (entry) => {
-      if (quotaStale(pool, entry.id, PROBE_MAX_AGE_MS, now) === false) return;
+      if (force === false && quotaStale(pool, entry.id, PROBE_MAX_AGE_MS, now) === false) return;
       try {
         const { token, auth } = await tokenFor(entry.path, { now, fetchImpl: undefined, proxyUrl });
         await probeAccount(entry, { token, auth, proxyUrl, now });
@@ -265,21 +277,48 @@ function createService({ settings, pool }) {
         // Unreachable, unreadable or unrefreshable: left to the passive path.
       }
     }));
+    scheduleLease();
+  }
+
+  const refreshDue = () => warm().catch(() => {});
+
+  /**
+   * Sleep until the pool's earliest reading falls due, then re-read.
+   *
+   * The server names the cadence in `renewal_seconds`, so a subscription is
+   * what sets the seconds between passes; a reading without one keeps the fixed
+   * bound. The 1.0-1.1 jitter is deliberate: waking below the due instant would
+   * find the reading still fresh and spend the pass for nothing.
+   */
+  function scheduleLease() {
+    clearTimeout(leaseTimer);
+    leaseTimer = undefined;
+    if (settings.quotaProbe === false) return;
+    const dueAt = earliestQuotaDueAt(pool, PROBE_MAX_AGE_MS);
+    if (dueAt === undefined) return;
+    const waitMs = Math.max(PROBE_MIN_WAIT_MS, Math.round((dueAt - Date.now()) * (1 + 0.1 * Math.random())));
+    leaseTimer = setTimeout(() => { refreshDue().finally(() => scheduleLease()); }, waitMs);
+    leaseTimer.unref?.();
   }
 
   /**
-   * Fill the pool before the first model request.
+   * Fill the pool, and optionally re-read every account's quota.
    *
    * Without this the panel stays blank until someone talks to the model, because
    * `pool.accounts` is only populated while a credential is being resolved.
-   * Accounts are listed immediately; their quota is only read up front when
-   * `quotaProbe` is on, since that is a real network call per account.
+   * Accounts are listed immediately; their quota is only read when `quotaProbe`
+   * is on, since that is a real network call per account. The settings panel
+   * calls this again with `force` the moment it is opened, so what is on screen
+   * is what the panel was opened to see rather than the startup reading.
    */
-  async function warm() {
+  async function warm({ force = false } = {}) {
     const { accounts } = await discoverAccounts({ accountsDir: settings.accountsDir });
     prunePool(pool, accounts.map((entry) => entry.id));
     warmPool(pool, accounts);
-    if (settings.quotaProbe) await probeAll(accounts, settings.proxyUrl);
+    // Opening the panel is the deliberate trigger that starts a new round of
+    // attempts; without it an account that spent them stays silent.
+    if (force === true) resetProbeAttempts(pool);
+    if (settings.quotaProbe) await probeAll(accounts, settings.proxyUrl, { force });
   }
 
   /** Attribute one already-sent response to its account. */
@@ -346,6 +385,7 @@ function createService({ settings, pool }) {
     integration: () => ({ ...integration }),
     noteAdapterRequest,
     warm,
+    scheduleLease,
     pin,
     pool
   };
@@ -370,8 +410,9 @@ export function apply(ctx, config) {
   const pool = createPool({ strategy: settings.strategy, accountsDir: settings.accountsDir });
   const service = createService({ settings, pool });
   // Fill the pool in the background so the settings panel can list the accounts
-  // right after a restart instead of waiting for the first model request.
-  void service.warm().catch(() => {});
+  // right after a restart instead of waiting for the first model request. The
+  // scheduler starts on that first pass so the cadence is the server's from then on.
+  void service.warm().catch(() => {}).finally(() => service.scheduleLease());
   const credentials = ctx.get("credentials");
   const originalResolve = credentials.resolve;
   const originalDescribe = credentials.describe;
@@ -399,6 +440,7 @@ export function apply(ctx, config) {
   // headless compositions, where the scoped injection simply never runs.
   const injected = typeof ctx.inject === "function" ? ctx.inject(["webServer"], (web) => registerQuotaRoute(web.webServer, service)) : undefined;
   return () => {
+    clearTimeout(leaseTimer);
     injected?.();
     provided?.();
     if (credentials.resolve === resolve) credentials.resolve = originalResolve;
@@ -432,16 +474,22 @@ async function readJsonBody(request) {
 }
 
 /**
- * Apply `{ pin: "<id>" | null }` from the settings panel and answer with the
- * pool as it now stands, so the caller can render the result without a second
- * round trip.
+ * Apply one instruction from the settings panel and answer with the pool as it
+ * now stands, so the caller can render the result without a second round trip.
+ * `{ refresh: true }` is the panel being opened and re-reading the accounts;
+ * `{ pin: "<id>" | null }` is the account switch.
  */
-async function applyPin(request, response, service) {
+async function handlePost(request, response, service) {
   let body;
   try {
     body = await readJsonBody(request);
   } catch {
     return sendJson(response, 400, { error: "invalid JSON body" });
+  }
+  const answer = () => sendJson(response, 200, { ...service.snapshot(), integration: service.integration?.() });
+  if (body?.refresh === true) {
+    await service.warm({ force: true });
+    return answer();
   }
   const requested = body?.pin;
   if (requested !== null && requested !== undefined && (typeof requested !== "string" || requested === "")) {
@@ -451,7 +499,7 @@ async function applyPin(request, response, service) {
     return sendJson(response, 404, { error: `unknown account: ${requested}` });
   }
   service.pin(requested ?? undefined);
-  return sendJson(response, 200, { ...service.snapshot(), integration: service.integration?.() });
+  return answer();
 }
 
 /** Serve the pool snapshot as JSON; no secret ever crosses this route. */
@@ -468,8 +516,8 @@ function registerQuotaRoute(webServer, service) {
       if (request.method === "POST") {
         // The body arrives asynchronously; a failure here must still produce a
         // reply rather than an unhandled rejection in the host's request loop.
-        applyPin(request, response, service).catch(() => {
-          if (response.headersSent !== true) sendJson(response, 500, { error: "pin failed" });
+        handlePost(request, response, service).catch(() => {
+          if (response.headersSent !== true) sendJson(response, 500, { error: "pool request failed" });
         });
         return;
       }
