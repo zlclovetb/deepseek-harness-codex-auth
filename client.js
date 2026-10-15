@@ -136,23 +136,32 @@ window.__ModuleLoader__.load({
       return `${Math.round(hours / 24)} 天前`
     }
 
-    function toneFor(usedPercent) {
-      if (typeof usedPercent !== "number" || !Number.isFinite(usedPercent)) return "idle"
-      if (usedPercent >= 100) return "spent"
-      return usedPercent >= 80 ? "warn" : "ok"
+    /**
+     * The snapshot reports consumption, but the panel shows what is left. Turning
+     * "0% used" into "100% remaining" is also what makes a window that exists but
+     * has not been touched distinguishable from one the account does not have.
+     */
+    function remainingPercent(usedPercent) {
+      return typeof usedPercent === "number" && Number.isFinite(usedPercent) ? 100 - usedPercent : undefined
     }
 
-    function Meter({ label, usedPercent, resetAt, now }) {
-      const known = typeof usedPercent === "number" && Number.isFinite(usedPercent)
-      const used = known ? Math.max(0, Math.min(100, Math.round(usedPercent))) : 0
+    function toneFor(remaining) {
+      if (typeof remaining !== "number" || !Number.isFinite(remaining)) return "idle"
+      if (remaining <= 0) return "spent"
+      return remaining <= 20 ? "warn" : "ok"
+    }
+
+    function Meter({ label, remaining, resetAt, now }) {
+      const known = typeof remaining === "number" && Number.isFinite(remaining)
+      const left = known ? Math.max(0, Math.min(100, Math.round(remaining))) : 0
       const reset = known ? resetLabel(resetAt, now) : undefined
       return jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }, children: [
         jsxs("div", { style: { display: "flex", justifyContent: "space-between", gap: 8, fontSize: 11, color: "var(--dsw-alias-label-secondary)" }, children: [
           jsx("span", { children: label }),
-          jsx("span", { style: { fontVariantNumeric: "tabular-nums" }, children: known ? `${used}%${reset ? ` · ${reset}` : ""}` : "暂无数据" }),
+          jsx("span", { style: { fontVariantNumeric: "tabular-nums" }, children: known ? `剩余 ${left}%${reset ? ` · ${reset}` : ""}` : "暂无数据" }),
         ] }),
         jsx("div", { style: { position: "relative", height: 6, borderRadius: 999, background: "var(--dsw-alias-bg-layer-2)", overflow: "hidden" }, children:
-          jsx("div", { style: { position: "absolute", inset: 0, width: `${used}%`, borderRadius: 999, background: STATE_COLOR[toneFor(usedPercent)] } }) }),
+          jsx("div", { style: { position: "absolute", inset: 0, width: `${left}%`, borderRadius: 999, background: STATE_COLOR[toneFor(remaining)] } }) }),
       ] })
     }
 
@@ -172,8 +181,8 @@ window.__ModuleLoader__.load({
           jsx("button", { type: "button", disabled: busy, onClick: () => onTogglePin(isPinned ? null : account.id), style: smallButtonStyle, children: isPinned ? "取消固定" : "用此账号" }),
         ] }),
         jsx("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 11, fontVariantNumeric: "tabular-nums" }, children: meta }),
-        jsx(Meter, { label: "5 小时窗口", usedPercent: account.usedPercent5h, resetAt: account.resetsAt5h, now }),
-        jsx(Meter, { label: "本周窗口", usedPercent: account.usedPercentWeekly, resetAt: account.resetsAtWeekly, now }),
+        jsx(Meter, { label: "5 小时窗口", remaining: remainingPercent(account.usedPercent5h), resetAt: account.resetsAt5h, now }),
+        jsx(Meter, { label: "本周窗口", remaining: remainingPercent(account.usedPercentWeekly), resetAt: account.resetsAtWeekly, now }),
       ] })
     }
 
