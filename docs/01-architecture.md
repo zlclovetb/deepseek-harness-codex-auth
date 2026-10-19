@@ -31,7 +31,7 @@ Codex CLI 已经在 `$CODEX_HOME/auth.json` 中保存了 ChatGPT 的 OAuth 令�
 │                                                                 │       │
 │                          ┌──────────────┐  GET /api/codex-pool  │       │
 │  ┌────────────────────┐  │  webServer   │◀──── client.js ───────┤       │
-│  │ Web UI 设置页       │  │ (宿主路由表)  │   QuotaPanel 轮询      │       │
+│  │ Web UI 设置页       │  │ (宿主路由表)  │   QuotaPanel GET/POST  │       │
 │  │ (provider-card)    │──│              │                       │       │
 │  └────────────────────┘  └──────────────┘                       ▼       │
 └──────────────────────────────────────────────────────── $CODEX_HOME/ ────┘
@@ -49,7 +49,7 @@ Codex CLI 已经在 `$CODEX_HOME/auth.json` 中保存了 ChatGPT 的 OAuth 令�
 | **账号池**（服务端） | [lib/](../lib) | 账号发现、额度解析、健康分/冷却与选择策略 |
 | **路由注入**（配置） | [cordis.patch.yml](../cordis.patch.yml) | 给 `llm-pi-ai` 挂 `openai-codex` 路由 + 插入本插件 + 池参数 |
 | **设置 UI**（浏览器端） | [client.js](../client.js) | 在模型页 provider 卡片注入「网络代理」输入框与「多账号额度」面板（含手动固定账号） |
-| **代理与观测**（补丁） | [patches/…pi-ai@0.2.0-rc.2.patch](../patches) | 给官方包增加 `proxyUrl` 支持与 `fetch` 注入点；**与官方包版本强绑定**，官方包升级后需重做（见 [README](../README.md#官方包补丁与升级适配)） |
+| **代理与观测**（补丁） | [patches/…pi-ai@0.2.1-rc.2.patch](../patches) | 给官方包增加 `proxyUrl` 支持与 `fetch` 注入点；**与官方包版本强绑定**，官方包升级后需重做（见 [README](../README.md#官方包补丁与升级适配)） |
 
 ## 3. 运行时数据流（一次模型请求）
 
@@ -65,9 +65,10 @@ Codex CLI 已经在 `$CODEX_HOME/auth.json` 中保存了 ChatGPT 的 OAuth 令�
      否则进入刷新分支（`refreshInflight` 按文件路径单飞去重）。
    - 成功 → `noteToken()` 记住 token↔账号、`markUsed()` 标记使用时间，返回 `{ value: token }`；
    - 失败（读不到 / 刷不动）→ `markCooldown(+30s)` 并试下一个账号。
-5. 若开启了 `quotaProbe` 且该账号的额度读数已过 `PROBE_MAX_AGE_MS`，**异步**发一次
-   `GET chatgpt.com/backend-api/wham/usage`（同进程 `undici.ProxyAgent` 复用同一 `proxyUrl`），
-   结果写回池状态；本次请求不等它。
+5. 若开启了 `quotaProbe` 且该账号的额度读数已过它的租期（`renewalSeconds`，或没有租期时的
+   `PROBE_MAX_AGE_MS`），**异步**读一次额度：先订阅 `POST …/wham/usage/subscriptions`（带
+   `renewal_seconds`），失败才回落拉取 `GET …/wham/usage`；两者复用同一 `proxyUrl`（同进程
+   `undici.ProxyAgent`），结果写回池状态；本次请求不等它。
 6. `llm-pi-ai` 用拿到的 token 发模型请求，`fetch` 已被补丁包成
    `rotation.wrapFetch(proxyFetch(profile.proxyUrl))`：
    - `proxyFetch` 决定网络出口（代理或直连）——**与未安装本插件时完全一致**；
@@ -85,7 +86,8 @@ DSH 启动
               └─ index.js: apply(ctx, config)
                     ├─ readSettings(config)  读 accountsDir / strategy / quotaProbe / proxyUrl
                     ├─ createPool() + createService()
-                    ├─ void service.warm()                      ← 后台预热账号池（quotaProbe 时顺带探测）
+                    ├─ void service.warm()                      ← 后台预热账号池（quotaProbe 时顺带读取）
+                    ├─ service.scheduleLease()                  ← 池共用一个 unref 定时器，按最早到期重读
                     ├─ ctx.get("credentials") 保存并替换 resolve / describe
                     ├─ ctx.provide("codexMultiAuth", service)   ← 供补丁后的适配器查找
                     ├─ ctx.inject(["webServer"], …)             ← 注册 /api/codex-pool（无则跳过）
@@ -96,8 +98,8 @@ DSH 启动
         └─ apply(ctx)
               └─ 在 settings.models.provider-card 注入 CodexProviderCard
                     ├─ ProxyField（写 providers["openai-codex"].proxyUrl）
-                    └─ QuotaPanel（15 秒轮询 GET /api/codex-pool 渲染额度；
-                                   POST 同一路由固定 / 取消固定账号）
+                    └─ QuotaPanel（打开即 POST {refresh:true} 强制重读，之后每 15 秒 GET 快照；
+                                   按「剩余 N%」渲染额度；POST 同一路由固定 / 取消固定账号）
 ```
 
 ## 5. 关键设计约束

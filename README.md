@@ -26,10 +26,17 @@ $CODEX_HOME/                     # 默认 ~/.codex
 
 额度来自两个渠道，都会写进进程内的账号状态：
 
-- **被动**：每个模型响应的 `x-codex-primary-used-percent`（5 小时窗口）与
-  `x-codex-secondary-used-percent`（本周窗口）等响应头；
-- **主动**（可选，`quotaProbe: true`）：在把请求交给某个账号之前、以及启动预热时，先读一次
-  `chatgpt.com/backend-api/wham/usage`。
+- **被动**（常态数据源）：每个模型响应的 `x-codex-primary-used-percent`（5 小时窗口）与
+  `x-codex-secondary-used-percent`（本周窗口）等响应头，由 `wrapFetch` 始终观测；
+- **主动**（可选，`quotaProbe: true`）：优先订阅 `POST …/wham/usage/subscriptions`，失败才回落
+  拉取 `GET …/wham/usage`；订阅响应里的 `renewal_seconds` 即服务端指定的「下次多久再来」。
+
+主动读取的**节奏由服务端说了算**：整个账号池共用一个 `unref` 定时器，按最早的到期读数安排下一次
+读取（下限 60 秒，避免服务端给的节奏过短变成热循环），读数没有租期时才回落到固定的 10 分钟新鲜度。
+
+而且这是**消耗次数、不是周期重试**：一次触发 = 首次尝试 + 最多 3 次重试（退避 60/120/240 秒）；
+用尽后该账号停探、所有自动读取也停下，直到你打开模型页 —— 面板打开的 `{refresh:true}` 会强制重读
+全部账号，才开启新一轮。
 
 调度策略由 `strategy` 决定：
 
@@ -42,10 +49,11 @@ $CODEX_HOME/                     # 默认 ~/.codex
 某个账号额度耗尽（任一窗口达到 100%）或返回 429 时，它会被冷落到该窗口的重置时间；后续请求自动
 切到别的账号。**切换发生在下一个请求**，不会在一次请求内重放。
 
-插件启动时会在后台**预热账号池**：设置页的「多账号额度」面板因此一重启就能列出所有账号，不必先发
-一次对话。账号的**额度数值**仍来自观测——发过请求才有（被动），或把 `quotaProbe` 设为 `true` 让
-启动时主动读一次（主动）。provider 走代理时，启动探测也需要代理：在插件配置里把 `proxyUrl` 填成
-与 provider 相同的地址，否则启动探测只能直连、在需要代理的网络里必然失败。
+插件启动时会在后台**预热账号池**（只列出账号，与 `quotaProbe` 无关）：设置页的「多账号额度」面板
+因此一重启就能列出所有账号，不必先发一次对话。账号的**额度数值**是否当场可读取决于 `quotaProbe`：
+默认只有发过请求才有（被动）；设为 `true` 后启动时主动读一次；而**打开面板**随时会强制重读全部
+账号。provider 走代理时，主动读取也需要代理：在插件配置里把 `proxyUrl` 填成与 provider 相同的地址，
+否则只能直连、在需要代理的网络里必然失败。
 
 要指定用哪个账号，在「多账号额度」面板点账号行右侧的「用此账号」手动固定，点顶部「恢复自动」
 交还给上面的策略。固定是**兜底式**的：被固定的账号额度耗尽或冷却中时，会临时回退到策略选择
@@ -60,25 +68,28 @@ $CODEX_HOME/                     # 默认 ~/.codex
 | --- | --- |
 | `accountsDir` | 账号目录（默认 `$CODEX_HOME/accounts`） |
 | `strategy` | `hybrid` / `round-robin` / `sticky`（默认 `hybrid`） |
-| `quotaProbe` | 是否在请求前及启动预热时主动探测额度（默认 `false`） |
-| `proxyUrl` | 启动探测所用的代理，填与 provider 相同的地址（默认直连） |
+| `quotaProbe` | 是否主动读取额度（订阅优先 + 拉取兜底）；关闭时只剩被动响应头（默认 `false`） |
+| `proxyUrl` | 主动读取所用的代理，填与 provider 相同的地址（默认直连） |
 | `rotateOnQuotaExhausted` | 设为 `false` 等价于 `strategy: sticky`（默认 `true`） |
 
 ## 安装
 
-要求 Node.js `>=22.19.0`、DeepSeek Harness `0.2.0-rc.2`，以及已完成：
+要求 Node.js `>=22.19.0`、DeepSeek Harness `0.2.0-rc.2`（宿主最低版本），以及已完成：
 
 ```powershell
 codex login
 codex login status
 ```
 
+> 上面的 `0.2.0-rc.2` 是插件要求的**最低宿主版本**；补丁的 `patchedDependencies` key 与补丁文件名
+> 必须**精确等于宿主实际安装的 `dsh-llm-pi-ai` 版本**，二者不是一回事（见下文「官方包补丁与升级适配」）。
+
 在本仓库打包并安装到 Web profile：
 
 ```powershell
 npm test
 npm pack
-dsh plugin --profile web add .\deepseek-harness-codex-auth-0.4.2.tgz
+dsh plugin --profile web add .\deepseek-harness-codex-auth-0.4.6.tgz
 dsh --profile web --dump-config
 dsh web
 ```
@@ -86,11 +97,12 @@ dsh web
 Bundle patch 会保留官方 `llm-pi-ai`，只加入 `openai-codex` 路由和认证桥。重启后在
 模型选择器中选择 `openai-codex` 下的模型。
 
-Web profile 同时应用 `patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch` 后，模型页的
+Web profile 同时应用 `patches/@deepseek-ai__dsh-llm-pi-ai@0.2.1-rc.2.patch` 后，模型页的
 `openai-codex` 卡片会出现「网络代理」输入框和「多账号额度」面板。代理只用于此 provider；
 建议同时把 `transport` 设为 `sse`，避免不支持 WebSocket 的 HTTP 代理先等待握手超时。
-额度面板每 15 秒读取一次宿主同源的 `/api/codex-pool`，展示各账号的 5 小时 / 本周用量与可用状态，
-并可在面板内点「用此账号」手动固定账号（`POST` 同一条路由）。
+额度面板打开时即 `POST /api/codex-pool {refresh:true}` 强制重读全部账号，随后每 15 秒 `GET` 一次
+同源快照；面板按**「剩余 N%」**展示各账号的 5 小时 / 本周窗口与重置倒计时，并可在面板内点
+「用此账号」手动固定账号（`POST` 同一条路由）。
 
 卸载：
 
@@ -114,7 +126,12 @@ dsh plugin --profile web remove deepseek-harness-codex-auth
 
 ### 改动清单
 
-补丁文件：[patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch](patches)
+补丁文件：`patches/` 下现有两个，各对应一个宿主版本：
+
+| 补丁文件 | 对应宿主 |
+| --- | --- |
+| [@deepseek-ai__dsh-llm-pi-ai@0.2.1-rc.2.patch](patches) | 当前：dsh 0.2.1-rc.2（其自带 pi-ai 即 0.2.1-rc.2），**必用** |
+| [@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch](patches) | 仍停在 dsh 0.2.0-rc.2 的宿主 |
 
 | # | 位置 | 改动 | 为什么 |
 | --- | --- | --- | --- |
@@ -125,7 +142,7 @@ dsh plugin --profile web remove deepseek-harness-codex-auth
 | 5 | `profileOptions(...)` | 增加第 4 参 `fetchImpl`，透传 `{ fetch: fetchImpl }` | 把上面选好的 fetch 交给 pi-ai |
 | 6 | 模型请求调用点 | `profileOptions(profile, reasoning, apiKey, this.config.fetchFor?.(profile))` | 接线 |
 | 7 | `PiAiAdapter` 构造 | `fetchFor: (profile) => profileFetch(ctx, profile)` | 接线 |
-| 8 | `resolveApiKey` | `credentials.resolve(ref, { proxyUrl: profile.proxyUrl })` | 令牌刷新、额度探测与模型请求走**同一个**出口 |
+| 8 | `resolveApiKey` | `credentials.resolve(ref, { proxyUrl: profile.proxyUrl })` | 令牌刷新、额度读取与模型请求走**同一个**出口 |
 | 9 | `lib/types/config.d.ts` | 补 `proxyUrl` 类型声明 | 类型完整 |
 
 第 4 项的三态是整套设计的关键 —— **补丁单独存在时不改变任何行为**：
@@ -158,8 +175,12 @@ function profileFetch(ctx, profile) {
 
 ### 升级后如何重新适配
 
-前提：只要 `profiles/web/package.json` 仍锁定 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2`，
+前提：只要 `profiles/web/package.json` 仍锁定 `@deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.2`，
 补丁就一直有效 —— 升级 DSH 应用本体不会自动改它。只有 profile 里的版本真的变了才需要走下面流程。
+`patchedDependencies` 的旧 key 写作 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2`；它必须**精确等于**
+被补丁包的版本，否则 pnpm 会静默跳过补丁（症状：额度一直空白、且没有任何报错）。升级要动三处：
+profile `package.json` 的包版本 → `pnpm-workspace.yaml` 的 `patchedDependencies` key 与补丁文件名
+一起改 → `pnpm install --no-frozen-lockfile`。
 
 ```powershell
 # 1. 确认实际加载的版本与补丁状态（应至少各命中一次）

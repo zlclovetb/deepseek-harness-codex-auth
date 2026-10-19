@@ -1,0 +1,144 @@
+diff --git a/lib/index.js b/lib/index.js
+index 4b1e5ad..14afb65 100644
+--- a/lib/index.js
++++ b/lib/index.js
+@@ -14,6 +14,7 @@ import { isContextOverflow } from "@earendil-works/pi-ai/utils/overflow";
+ import { homedir } from "node:os";
+ import { access } from "node:fs/promises";
+ import { resolve } from "node:path";
++import { ProxyAgent, fetch as undiciFetch } from "undici";
+ //#region lib/types/replay.js
+ /**
+ * Durable pi-ai replay metadata and assistant-history reconstruction.
+@@ -1051,6 +1052,7 @@ const profile = z.object({
+ 	displayName: z.string(),
+ 	api: z.union(supportedProtocols()),
+ 	baseURL: z.string(),
++	proxyUrl: z.string(),
+ 	models: z.array(modelProfile),
+ 	modelOverrides: z.dict(modelOverride),
+ 	compat: compatProfile,
+@@ -1738,6 +1740,35 @@ var __disposeResources = (function(SuppressedError) {
+ 	var e = new Error(message);
+ 	return e.name = "SuppressedError", e.error = error, e.suppressed = suppressed, e;
+ });
++const proxyFetchers = /* @__PURE__ */ new Map();
++function proxyFetch(proxyUrl) {
++	let fetcher = proxyFetchers.get(proxyUrl);
++	if (fetcher !== void 0) return fetcher;
++	const url = new URL(proxyUrl);
++	if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error(`llm-pi-ai proxyUrl only supports HTTP(S): ${url.protocol}`);
++	const dispatcher = new ProxyAgent(url);
++	// ponytail: one dispatcher per configured URL; add eviction only if live proxy churn becomes real.
++	fetcher = (input, init) => undiciFetch(input, { ...init, dispatcher });
++	proxyFetchers.set(proxyUrl, fetcher);
++	return fetcher;
++}
++/**
++* The transport one profile's requests use.
++*
++* This route keeps its own proxy decision: the plugin's rotation layer only
++* wraps whatever transport is chosen here, so adding quota observation can never
++* change whether — or through where — a request reaches the network.
++*
++* @param ctx - host context, where the credential plugin may have provided a pool.
++* @param profile - the resolved provider profile.
++* @returns the fetch to inject, or `undefined` when neither a proxy nor a pool applies.
++*/
++function profileFetch(ctx, profile) {
++	const base = profile.proxyUrl === void 0 ? void 0 : proxyFetch(profile.proxyUrl);
++	const rotation = ctx.get("codexMultiAuth");
++	if (rotation === void 0) return base;
++	return rotation.wrapFetch(base);
++}
+ /**
+ * Initially active declaration added to an Anthropic request whose projected
+ * tools are all deferred, because Anthropic rejects a tool list without one.
+@@ -1751,7 +1782,7 @@ const ANTHROPIC_TOOL_UPDATE_PLACEHOLDER = {
+ 	}
+ };
+ /** Copy profile stream knobs into pi-ai's common option vocabulary. */
+-function profileOptions(profile, reasoning, apiKey) {
++function profileOptions(profile, reasoning, apiKey, fetchImpl) {
+ 	const enabledReasoning = reasoning === "off" ? void 0 : reasoning;
+ 	return {
+ 		...apiKey === void 0 ? {} : { apiKey },
+@@ -1759,6 +1790,7 @@ function profileOptions(profile, reasoning, apiKey) {
+ 		...profile.thinkingBudgets === void 0 ? {} : { thinkingBudgets: profile.thinkingBudgets },
+ 		...profile.cacheRetention === void 0 ? {} : { cacheRetention: profile.cacheRetention },
+ 		...profile.transport === void 0 ? {} : { transport: profile.transport },
++		...fetchImpl === void 0 ? {} : { fetch: fetchImpl },
+ 		...profile.timeoutMs === void 0 ? {} : { timeoutMs: profile.timeoutMs },
+ 		...profile.websocketConnectTimeoutMs === void 0 ? {} : { websocketConnectTimeoutMs: profile.websocketConnectTimeoutMs },
+ 		maxRetries: 0
+@@ -1981,7 +2013,7 @@ var PiAiAdapter = class extends LlmAdapter {
+ 					}
+ 				}, onReplayDegrade);
+ 				const iterator = toStreamChunks(snapshot.models.streamSimple(model, context, {
+-					...profileOptions(profile, reasoning, apiKey),
++						...profileOptions(profile, reasoning, apiKey, this.config.fetchFor?.(profile)),
+ 					...options.temperature === void 0 ? {} : { temperature: options.temperature },
+ 					...options.maxTokens === void 0 ? {} : { maxTokens: options.maxTokens },
+ 					...options.sessionId === void 0 ? {} : { sessionId: String(options.sessionId) },
+@@ -2893,7 +2925,7 @@ function apply(ctx, config) {
+ 		const ref = profile.apiKeyEnv;
+ 		if (ref === void 0) return void 0;
+ 		const credentials = ctx.get("credentials");
+-		const hit = credentials !== void 0 ? (await credentials.resolve(ref))?.value : launchEnvironmentOf(ctx).get(ref)?.value;
++		const hit = credentials !== void 0 ? (await credentials.resolve(ref, { proxyUrl: profile.proxyUrl }))?.value : launchEnvironmentOf(ctx).get(ref)?.value;
+ 		if (hit !== void 0 && hit.length > 0) return assertUsableApiKey(hit, "llm-pi-ai", ref);
+ 		throw new LlmError(`llm-pi-ai: no credential for provider route "${provider}"; its profile resolves ${ref}, which is not set — store ${ref} through the credentials service (the web Models page writes it) or export it, and remove apiKeyEnv only if this provider should authenticate from pi-ai's own environment discovery`, "MISSING_CREDENTIAL");
+ 	};
+@@ -2904,6 +2936,7 @@ function apply(ctx, config) {
+ 	const adapter = new PiAiAdapter({
+ 		profiles,
+ 		resolveApiKey,
++		fetchFor: (profile) => profileFetch(ctx, profile),
+ 		auth,
+ 		resolveAttachments: () => ctx.get("attachments"),
+ 		resolveImageAccess: (attachments, ref) => resolveImageAttachmentAccess(attachments, (hostPath) => ctx.get("fs")?.processPathFromHostPath(hostPath), ref),
+diff --git a/lib/types/config.d.ts b/lib/types/config.d.ts
+index f45d7d9..9323de4 100644
+--- a/lib/types/config.d.ts
++++ b/lib/types/config.d.ts
+@@ -64,6 +64,8 @@ export interface PiAiProviderProfile {
+     api?: string;
+     /** Endpoint for this route's models; defaults to the installed catalog's endpoint. */
+     baseURL?: string;
++    /** HTTP(S) forward proxy used only by this provider route. */
++    proxyUrl?: string;
+     /**
+      * This route's model catalog. Omission serves the installed catalog for the
+      * route unchanged; an explicit list replaces it, each entry defaulting its
+@@ -197,6 +199,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName?: string | null;
+         api?: string | null;
+         baseURL?: string | null;
++        proxyUrl?: string | null;
+         models?: PiAiModelProfile[] | null;
+         modelOverrides?: import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string> | null;
+         compat?: PiAiCompatProfile | null;
+@@ -225,6 +228,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName: z<string, string, "plain">;
+         api: z<string, string, "plain">;
+         baseURL: z<string, string, "plain">;
++        proxyUrl: z<string, string, "plain">;
+         models: z<PiAiModelProfile[], PiAiModelProfile[], "plain">;
+         modelOverrides: z<import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, "plain">;
+         compat: z<PiAiCompatProfile>;
+@@ -260,6 +264,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName?: string | null;
+         api?: string | null;
+         baseURL?: string | null;
++        proxyUrl?: string | null;
+         models?: PiAiModelProfile[] | null;
+         modelOverrides?: import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string> | null;
+         compat?: PiAiCompatProfile | null;
+@@ -288,6 +293,7 @@ export declare const Config: z<Schemastery.ObjectS<NoInfer<{
+         displayName: z<string, string, "plain">;
+         api: z<string, string, "plain">;
+         baseURL: z<string, string, "plain">;
++        proxyUrl: z<string, string, "plain">;
+         models: z<PiAiModelProfile[], PiAiModelProfile[], "plain">;
+         modelOverrides: z<import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, import("@deepseek-ai/cosmokit").Dict<PiAiModelOverride, string>, "plain">;
+         compat: z<PiAiCompatProfile>;

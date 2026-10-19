@@ -24,10 +24,11 @@ DeepSeek Harness 插件：让官方 `llm-pi-ai` 适配器直接复用 **Codex CL
   - 浏览器端：[client.js](../client.js)
 - **核心机制**：拦截名为 `OPENAI_CODEX_AUTH` 的**单条**凭据引用，改为实时读取
   `$CODEX_HOME/auth.json`（默认 `~/.codex/auth.json`），必要时按 Codex CLI 协议刷新并原子写回。
-- **账号池**：`$CODEX_HOME/accounts/<name>/auth.json` 存在时按多个账号轮换；额度取自响应头，
-  亦可选主动探测；插件**启动即后台预热**，面板无需先对话即可列出账号（`quotaProbe: true` 时
-  连额度也一并预先探测，此时若 provider 走代理，插件配置里也要填同样的 `proxyUrl`），面板里还可
-  手动固定某个账号（兜底式、仅进程内）。无该目录时回退到单账号，行为与旧版一致。
+- **账号池**：`$CODEX_HOME/accounts/<name>/auth.json` 存在时按多个账号轮换；额度取自响应头（被动），
+  亦可选主动读取（`quotaProbe: true`：订阅优先 + 拉取兜底，节奏由服务端 `renewal_seconds` 租期决定）；
+  插件**启动即后台预热**，面板无需先对话即可列出账号，**打开面板会强制重读全部账号**（此时若 provider
+  走代理，插件配置里也要填同样的 `proxyUrl`），面板里还可手动固定某个账号（兜底式、仅进程内）。
+  无该目录时回退到单账号，行为与旧版一致。
 - **依赖**：仅一个运行时依赖 `undici`；其余能力（`credentials` / `slots` / `configForms` /
   `webServer`）由宿主 DeepSeek Harness 注入。
 

@@ -25,7 +25,7 @@ Cordis 插件名，需与 `cordis.patch.yml` 中 `insert[].id` 一致。
 适配器行为不变。
 
 #### `QUOTA_ROUTE = "/api/codex-pool"`
-客户端面板轮询的**精确**路径，注册在宿主的 `webServer` 上。
+客户端面板读取的**精确**路径，注册在宿主的 `webServer` 上。
 
 #### `CLIENT_ID = "app_EMoamEEZ73f0CkXaXp7hrann"`
 Codex CLI 使用的公开 OAuth 客户端 id，刷新令牌时作为 `client_id` 提交。
@@ -38,7 +38,14 @@ Codex CLI 使用的公开 OAuth 客户端 id，刷新令牌时作为 `client_id`
 提前刷新窗口。当 access token 剩余有效期 ≤ 5 分钟时即触发刷新。
 
 #### `PROBE_MAX_AGE_MS = 10 * 60 * 1000`
-主动探测结果的可信时长。比这更新的读数不会触发第二次探测。
+**无租期读数**（拉取路径）的可信时长兜底。带服务端 `renewalSeconds` 的读数以它自己的租期为准。
+
+#### `PROBE_MIN_WAIT_MS = 60 * 1000`
+调度的下限：即使服务端给的 `renewal_seconds` 很短，也至少等这么久，避免把服务端的节奏变成热循环。
+
+#### `let leaseTimer`（模块级）
+池**共用**的单个 `unref` 定时器。`scheduleLease()` 按 `earliestQuotaDueAt()` 安排下一次重读，并在
+到期时间上加 0–10% 抖动；只有 `quotaProbe` 打开时才调度。
 
 #### `const refreshInflight`（模块级 `Map`）
 `auth.json 路径 → 正在进行的刷新 Promise`。用于**按账号**去重：同一账号的过期窗口内
@@ -53,8 +60,8 @@ Codex CLI 使用的公开 OAuth 客户端 id，刷新令牌时作为 `client_id`
 
 #### `readSettings(config): { accountsDir, quotaProbe, proxyUrl, rotateOnQuotaExhausted, strategy }`
 - `rotateOnQuotaExhausted` 默认 `true`，显式 `false` 时等价于 `"sticky"`；
-- `quotaProbe` 默认 `false`，必须显式为 `true` 才开启主动探测；
-- `proxyUrl` 为可选的启动探测代理：适配器只在解析凭据时才把它的代理交出来，而启动探测在此之前
+- `quotaProbe` 默认 `false`，必须显式为 `true` 才开启主动读取；
+- `proxyUrl` 为可选的主动读取代理：适配器只在解析凭据时才把它的代理交出来，而主动读取在此之前
   就要发请求，因此在代理环境里需在此重复一次（非字符串或空串视为未设置）；
 - `strategy` 经 `normalizeStrategy()` 归一，非法值回落到 `"hybrid"`。
 
@@ -73,7 +80,7 @@ Codex CLI 使用的公开 OAuth 客户端 id，刷新令牌时作为 `client_id`
 - 否则 `new ProxyAgent(proxyUrl)`，`request = (input, init) => undiciFetch(input, { ...init, dispatcher })`，
   `close()` 负责关闭 dispatcher。
 
-刷新与主动探测共用它，因此两者走**同一个网络出口**。
+刷新与主动读取共用它，因此两者走**同一个网络出口**。
 
 #### `async refresh(path, auth, fetchImpl): Promise<string>`
 执行一次 OAuth refresh，并在安全时写回。
@@ -130,14 +137,15 @@ async resolveCodexCredential({ path = authPath(), now = Date.now(), fetchImpl, p
 | `snapshot(now)` | `poolSnapshot()` 的可序列化视图 |
 | `integration()` | 补丁自检状态 `{ hooked, stockAdapter }`，随 `/api/codex-pool` 下发 |
 | `noteAdapterRequest(withOptions)` | 记录凭据调用是否带 profile options（原版适配器的判据） |
-| `warm()` | 后台预热池：建全量账号条目，`quotaProbe` 打开时顺带主动探测；装配时即调用 |
+| `warm({ force })` | 后台预热池：建全量账号条目；`force` 时重置探测次数并强制全读，`quotaProbe` 打开时顺带主动读取；装配时即调用 |
+| `scheduleLease()` | 安排池共用的 `unref` 定时器，按最早到期读数重读（下限 60 秒 + 抖动） |
 | `pin(id)` | 手动固定账号（`null` / `undefined` 即取消）；只作用于之后的请求，不落盘 |
 | `pool` | 池状态本体（诊断用） |
 
 **`resolve({ proxyUrl, now })`**
 
 1. `discoverAccounts()` → `prunePool(pool, ids)`（丢掉已消失的账号）→
-   `noteProbeProxy(accounts, proxyUrl)`（`quotaProbe` 打开且代理变化时补一次探测）；
+   `noteProbeProxy(accounts, proxyUrl)`（`quotaProbe` 打开且代理变化时补读一次）；
 2. 循环，最多试遍所有账号：
    - 只剩一个候选时直接用它，否则 `selectAccount(pool, remaining, { now })`；
    - `claim()` 成功即返回；
@@ -149,43 +157,48 @@ async resolveCodexCredential({ path = authPath(), now = Date.now(), fetchImpl, p
 
 `tokenFor()` → `noteToken()`（记 token↔账号）→ `markUsed()` →
 若 `settings.quotaProbe && quotaStale(pool, id, PROBE_MAX_AGE_MS, now)` 则
-`void probeAccount(...)`（**不 await**，本次请求不等探测）。
+`void probeAccount(...)`（**不 await**，本次请求不等读取）。`quotaStale` 用的是读数的租期
+（有 `renewalSeconds` 时比 10 分钟更长），因此刚读过的账号不会被重复读。
 
 > 「先选账号、再刷新」正是「下一个请求才切换」的实现方式：本次响应头观测到的额度，
 > 影响的是下一次选择。
 
 **`probeAccount(entry, { token, auth, proxyUrl, now })`**
 
-`requesterFor(undefined, proxyUrl)` → `probeQuota({ token, accountId: accountIdentity(auth),
-fetchImpl: request, refresh: () => refresh(entry.path, auth, request), now })` → `recordQuota()`；
-`finally` 中 `close()`。整体 try-catch，探测失败不冒泡。
+`requesterFor(undefined, proxyUrl)` → `readQuota({ token, accountId: accountIdentity(auth),
+fetchImpl: request, refresh: () => refresh(entry.path, auth, request), now })`（**订阅优先、拉取兜底**）
+→ 有读数 `recordQuota()`，无读数 `markProbeFailure()`；`finally` 中 `close()` 并 `scheduleLease()`。
+整体 try-catch：读取失败按次数退避（60/120/240 秒，3 次用尽后停探），绝不冒泡。
 
-**`warm()`**
+**`warm({ force = false })`**
 
-装配时后台调用（`apply()` 里 `void service.warm()`），让面板不必等首个模型请求：
+装配时后台调用（`apply()` 里 `void service.warm()`），面板打开时以 `{ force: true }` 再调一次，
+让面板不必等首个模型请求：
 
 1. `discoverAccounts()` → `prunePool()` → `warmPool(pool, accounts)`：把每个账号建成池条目
    （**只列账号，不选中、不记 `lastUsedAt`、不造额度读数**）；
-2. `settings.quotaProbe === true` 时再 `await probeAll(accounts, settings.proxyUrl)`。
+2. `force === true` 时先 `resetProbeAttempts(pool)` —— 打开面板是**唯一**开启新一轮尝试的触发；
+3. `settings.quotaProbe === true` 时再 `await probeAll(accounts, settings.proxyUrl, { force })`
+   （`force` 会无视读数的新鲜度、强制全读一遍）。
 
 `proxyUrl` 一并传进去，是因为适配器要到解析凭据时才交出它的代理，而这一步在首个请求之前就要发
-网络请求；代理环境里不填 `proxyUrl`，探测只能直连、必然失败。
+网络请求；代理环境里不填 `proxyUrl`，读取只能直连、必然失败。
 
 没有它时 `pool.accounts` 只在 `resolve()` 内被填充，重启后池为空，面板要等第一次对话才显示账号。
 
-**`probeAll(accounts, proxyUrl)`**
+**`probeAll(accounts, proxyUrl, { force })`**
 
-`Promise.all` 遍历账号，跳过 `quotaStale(pool, id, PROBE_MAX_AGE_MS, now) === false` 的（读数仍新鲜），
-其余逐个 `tokenFor()` + `probeAccount()`；单个账号失败只吞掉自己的错误，不影响其它账号，也不冒泡。
-探测**复用同一 `proxyUrl`**，与令牌刷新、模型请求同一出口。
+`Promise.all` 遍历账号，`force` 为假时跳过 `quotaStale(pool, id, PROBE_MAX_AGE_MS, now) === false`
+的（读数仍新鲜），为真时全部读一遍；其余逐个 `tokenFor()` + `probeAccount()`；单个账号失败只吞掉
+自己的错误，不影响其它账号，也不冒泡。读取**复用同一 `proxyUrl`**，与令牌刷新、模型请求同一出口。
 
 **`probedProxy` / `noteProbeProxy(accounts, proxyUrl)`**
 
 启动时拿不到 provider 的 `proxyUrl`（它只在 `credentials.resolve(ref, { proxyUrl })` 的参数里出现），
 而代理环境下不设代理就访问不到 `chatgpt.com`。因此 `probedProxy` **以插件配置的 `proxyUrl` 起头**
 （未配置则为 `null`，即直连那一轮）；首个携带 `proxyUrl` 的 `resolve()` 一旦发现 key 变化，就对
-**仍无新鲜读数**的账号再探一次（`Promise.all` 并行）——覆盖「provider 改了代理」的情形。
-代价是已被 `claim()` 探测过的账号可能多一次只读 GET。`settings.quotaProbe` 为假时
+**仍无新鲜读数**的账号再读一次（`Promise.all` 并行）——覆盖「provider 改了代理」的情形。
+代价是已被 `claim()` 读取过的账号可能多一次只读请求。`settings.quotaProbe` 为假时
 `noteProbeProxy()` 直接返回，完全不做这些事。
 
 **`observe({ token, authorization, status, headers, now })`**
@@ -276,13 +289,14 @@ function wrapFetch(baseFetch) {
 `webServer.register({ kind: "exact", path: QUOTA_ROUTE, handler })`：
 
 - `GET` → `200` + `service.snapshot()` 并附 `integration` 字段（补丁自检状态）的 JSON；
-- `POST` → 读 `{ pin: "<id>" | null }`，调 `service.pin()`，同样返回**变更后**的快照
-  （面板因此不必再等一轮轮询）。`pin` 不是字符串或为 `null` 以外的类型 → `400`；
-  未知账号 → `404`；请求体不是 JSON 或超过 4 KiB → `400`；
+- `POST` **三态**，都返回**变更后**的快照（面板因此不必再等一轮读取）：
+  - `{ refresh: true }` → `service.warm({ force: true })`（面板打开时强制重读全部账号，并重置探测次数）；
+  - `{ pin: "<id>" }` → `service.pin(id)` 固定该账号；`{ pin: null }` 交还自动选择；
+  - 请求体不是 JSON、或 `pin` 是非字符串且非空 → `400`；未知账号 → `404`；请求体超过 4 KiB → `400`；
 - 其它方法 → `405` + `{ error: "method not allowed" }`；
 - 统一带 `cache-control: no-store`。**响应体里没有任何 token 或账号凭据**。
 
-`POST` 的 body 是异步到达的，`applyPin()` 的失败一律收敛为 `500`，不会变成宿主请求循环里的
+`POST` 的 body 是异步到达的，`handlePost()` 的失败一律收敛为 `500`，不会变成宿主请求循环里的
 未处理 rejection。该路由与 `GET` 一样同源、无鉴权 —— 与 [01-architecture.md](./01-architecture.md#6-边界与不支持项)
 里的「本机可信插件」前提一致。
 
@@ -341,9 +355,12 @@ function wrapFetch(baseFetch) {
 | `retryAt(state, now)` | 冷却与额度重置中较晚者 |
 | `selectAccount(pool, entries, { now })` | 按策略选择，见下 |
 | `markUsed` / `markCooldown` | 记录使用时间 / 置入冷却 |
-| `quotaStale(pool, id, maxAgeMs, now)` | 读数缺失或过期 |
-| `recordQuota(pool, id, quota, now)` | 合并主动探测结果，未耗尽则解除冷却 |
-| `recordOutcome(pool, id, { status, headers, now })` | 合并响应头并按状态码记账 |
+| `quotaStale(pool, id, maxAgeMs, now)` | 读数缺失或超过其**租期**（有 `renewalSeconds` 时用它，否则用 `maxAgeMs`）；`probeHalted` 的账号恒为 `false` |
+| `earliestQuotaDueAt(pool, fallbackMs, now)` | 池内最早的到期时刻（每账号取 `max(读数到期, 自己的重试时间)`）；空池 `undefined` |
+| `markProbeFailure(pool, id, now)` | 记一次失败：退避 60/120/240 秒；超过 `PROBE_RETRY_LIMIT` 后置 `probeHalted`、不再排期 |
+| `resetProbeAttempts(pool)` | 把所有账号的探测次数还回（打开面板强制刷新时调用） |
+| `recordQuota(pool, id, quota, now)` | 合并主动读取结果，未耗尽则解除冷却，并清掉失败计数 |
+| `recordOutcome(pool, id, { status, headers, now })` | 合并响应头并按状态码记账，同时清掉失败计数 |
 | `poolSnapshot(pool, now)` | 见下 |
 
 **`selectAccount` 的策略**
@@ -398,9 +415,12 @@ function wrapFetch(baseFetch) {
 
 | 导出 | 说明 |
 | --- | --- |
-| `USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage` |
-| `parseUsage(payload, now)` | 递归收集含 `used_percent` 的对象，按 `windowSeconds` 升序分成 primary/secondary，输出与 `parseQuota` 同形状（带 `source: "probe"`） |
-| `probeQuota({ token, accountId, fetchImpl, refresh, url, now })` | `GET`，头 `accept` / `authorization` / `chatgpt-account-id`，15 秒超时；401 且给了 `refresh` 时刷新一次再重试；任何失败返回 `undefined` |
+| `USAGE_URL` | `https://chatgpt.com/backend-api/wham/usage`（拉取，GET） |
+| `SUBSCRIPTIONS_URL` | `https://chatgpt.com/backend-api/wham/usage/subscriptions`（订阅，POST，无 body） |
+| `parseUsage(payload, now)` | 递归收集含 `used_percent` 的对象，**按声明长度分槽**（≤18000 秒 → 5 小时，>18000 秒 → 本周），输出与 `parseQuota` 同形状（带 `source: "probe"`）；槽位缺失即留空 |
+| `probeQuota({ token, accountId, fetchImpl, refresh, url, now })` | `GET`，头 `accept` / `authorization` / `chatgpt-account-id`，15 秒超时；401 且给了 `refresh` 时刷新一次再重试；任何失败返回 `undefined`；**不带 `renewalSeconds`** |
+| `probeSubscriptions({ … })` | `POST`，头另加 `OAI-App-Brand: codex` / `x-openai-codex-pricing-chooser: 1`；把响应里的 `renewal_seconds`（>0）挂到读数的 `renewalSeconds` 上 |
+| `readQuota(options)` | 先 `probeSubscriptions()`，失败才回落 `probeQuota()` |
 
 ---
 
@@ -427,11 +447,12 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 - 禁用条件：`snapshot.status !== "ready" || !snapshot.writable || state === "saving"`。
 
 ### `usePool()`
-轮询 hook。挂载时立即 `fetch(QUOTA_ROUTE)`，随后每 `POLL_INTERVAL_MS` 一次；
+读取 hook。挂载时**同时** `GET(QUOTA_ROUTE)` 与 `POST {refresh:true}`（打开面板即强制宿主重读
+全部账号、并重置探测次数），随后每 `POLL_INTERVAL_MS` 一次 `GET`；
 失败时保留上一次的 `snapshot`，只把 `status` 置为 `"offline"`；
 卸载时 `clearInterval` 并置 `live = false` 丢弃迟到的响应。
 返回值在 `{ status, snapshot }` 之外还带一个 `apply(snapshot)`：`POST` 的响应体本身就是新的池快照，
-用它直接顶替读数，于是切换立刻可见，不必等下一个轮询周期。
+用它直接顶替读数，于是切换立刻可见，不必等下一个周期。
 
 ### `QuotaPanel({ provider })`
 - 同样只作用于 `openai-codex`；
@@ -445,20 +466,23 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 - 从未拿到快照 → 「多账号额度不可用（当前运行环境未提供 Web 接口）」；
 - `unpatched`（`snapshot.integration.hooked === false && snapshot.integration.stockAdapter === true`）
   → 告警「额度观测未生效：当前 llm-pi-ai 未适配本插件……」，优先级高于「空列表」提示；
-- `accounts` 为空 → 「尚未观测到账号：发起一次对话后，这里会显示各账号的额度」；
+- `accounts` 为空 → 「尚未列出账号：账号目录仍在读取，或未发现任何登录」；
 - 否则逐账号渲染 `AccountRow`。
 
-### `sinceLabel(at, now)` / `resetLabel(at, now)`
-把时间戳渲染成相对文案：前者「刚刚 / N 分钟前 / N 小时前 / N 天前」（用于「上次使用」），
-后者「N 分钟后重置 / N 小时后重置 / N 天后重置」。
+### `remainingPercent(usedPercent)` / `toneFor(remaining)` / `sinceLabel(at, now)` / `resetLabel(at, now)`
+`remainingPercent` = `100 - usedPercent`（面板显示**剩余**而非已用）；`toneFor` 分档：≤0 耗尽 /
+≤20 告警 / 其余正常 / 未知 `idle`。`sinceLabel` / `resetLabel` 把时间戳渲染成相对文案：前者
+「刚刚 / N 分钟前 / N 小时前 / N 天前」（用于「上次使用」），后者「N 分钟后重置 / N 小时后重置 /
+N 天后重置」。
 
-### `Meter({ label, usedPercent, resetAt, now })` / `AccountRow({ account, now, isCurrent, isPinned, busy, onTogglePin })`
+### `Meter({ label, remaining, resetAt, now })` / `AccountRow({ account, now, isCurrent, isPinned, busy, onTogglePin })`
 用量进度条与账号行：5 小时 / 本周两条，轨道用 `--dsw-alias-bg-layer-2`，
-填充色按使用率取 `--dsw-alias-state-success-primary`（<80%）/
-`--dsw-alias-state-warn-primary`（≥80%）/ `--dsw-alias-state-error-primary`（≥100%）；
-未观测到读数时显示「暂无数据」。`AccountRow` 首行为账号 id 加条件渲染的「当前」/「已固定」标记，
-次行为「上次使用 …／尚未使用」与健康状况（`health < 0.95` 时显示），尾部角标显示
-可用 / 冷却中 / 额度耗尽，以及手动固定按钮（「用此账号」↔「取消固定」，`busy` 期间禁用）。
+填充色按**剩余**取 `--dsw-alias-state-success-primary`（>20%）/
+`--dsw-alias-state-warn-primary`（≤20%）/ `--dsw-alias-state-error-primary`（≤0）；
+读数未知（`remaining` 为 `null`）时显示「暂无数据」，不借用另一个窗口的数字。`AccountRow` 首行为
+账号 id 加条件渲染的「当前」/「已固定」标记，次行为「上次使用 …／尚未使用」与健康状况
+（`health < 0.95` 时显示），尾部角标显示可用 / 冷却中 / 额度耗尽，以及手动固定按钮
+（「用此账号」↔「取消固定」，`busy` 期间禁用）。
 
 ### `CodexProviderCard(props)`
 组合 `ProxyField` + `QuotaPanel`，统一做 `provider.provider === "openai-codex"` 判断。
@@ -481,8 +505,8 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 | --- | --- | --- | --- |
 | `accountsDir` | `string` | `$CODEX_HOME/accounts` | 账号目录 |
 | `strategy` | `"hybrid" \| "round-robin" \| "sticky"` | `"hybrid"` | 选择策略，非法值回落 `hybrid` |
-| `quotaProbe` | `boolean` | `false` | 是否在请求前、以及启动预热时主动探测额度 |
-| `proxyUrl` | `string` | 直连 | 启动探测所用的代理（与 provider 的 `proxyUrl` 相同）；代理环境里必填 |
+| `quotaProbe` | `boolean` | `false` | 是否主动读取额度（订阅优先 + 拉取兜底）；关闭时只剩被动响应头 |
+| `proxyUrl` | `string` | 直连 | 主动读取所用的代理（与 provider 的 `proxyUrl` 相同）；代理环境里必填 |
 | `rotateOnQuotaExhausted` | `boolean` | `true` | `false` 等价于 `strategy: "sticky"` |
 
 ## 环境变量汇总

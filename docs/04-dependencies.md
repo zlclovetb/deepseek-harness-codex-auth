@@ -10,7 +10,7 @@ deepseek-harness-codex-auth
 ├── (宿主注入)    slots / configForms      ── client.js inject
 ├── (宿主注入)    react / react/jsx-runtime ── client.js factory 的 require
 ├── (宿主提供)    llm-pi-ai 适配器          ── 通过 cordis.patch.yml 扩展
-└── (可选补丁)    @deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2 ── 提供 proxyUrl + fetch 注入点
+└── (可选补丁)    @deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.2 ── 提供 proxyUrl + fetch 注入点（另保留 0.2.0-rc.2 补丁）
 ```
 
 **要点**：除 `undici` 外，几乎所有能力都来自宿主运行时注入，而不是 npm 依赖。因此本包
@@ -23,7 +23,7 @@ deepseek-harness-codex-auth
 | `undici` | `^8.11.2` | 提供 `ProxyAgent`（HTTP(S) 转发代理 dispatcher）与 `fetch` | [index.js](../index.js#L2) 的 `requesterFor()` |
 
 - 仅**配置了 `proxyUrl` 且未注入 `fetchImpl`** 时才构造 `ProxyAgent`；
-- 令牌刷新与主动额度探测都经 `requesterFor()`，因此**共用同一代理出口**；
+- 令牌刷新与主动额度读取都经 `requesterFor()`，因此**共用同一代理出口**；
 - 用完立即 `dispatcher.close()`，不做长期连接复用；
 - 无代理场景直接使用 `globalThis.fetch`，不引入 undici。
 
@@ -67,9 +67,10 @@ deepseek-harness-codex-auth
 
 ## 5. 补丁（patch）详解
 
-文件：[patches/@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch](../patches)
+文件：[patches/@deepseek-ai__dsh-llm-pi-ai@0.2.1-rc.2.patch](../patches)（当前宿主用）；
+另保留 `@deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch`，供仍停在 dsh 0.2.0-rc.2 的宿主使用。
 
-对官方包 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2` 的改动：
+对官方包 `@deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.2` 的改动（与 0.2.0-rc.2 版补丁内容一致）：
 
 ### `lib/index.js`
 1. `import { ProxyAgent, fetch as undiciFetch } from "undici"`；
@@ -125,7 +126,7 @@ deepseek-harness-codex-auth
 
 **为什么需要这个补丁**：本插件负责「拿到 token」，但请求经由哪个网络出口由 `llm-pi-ai`
 决定。补丁把每 provider 的 `proxyUrl` 一路传到 pi-ai 的 `fetch` 选项，并在 `resolve` 时
-把同一 `proxyUrl` 交给本插件，从而让**令牌刷新、额度探测与模型请求走同一个代理**。
+把同一 `proxyUrl` 交给本插件，从而让**令牌刷新、额度读取与模型请求走同一个代理**。
 
 **分层顺序**（由内到外）：
 
@@ -138,13 +139,14 @@ deepseek-harness-codex-auth
 ### 补丁的注册与升级
 
 补丁不靠手动 `git apply`，而是由 pnpm 托管：`profiles/web/pnpm-workspace.yaml` 的
-`patchedDependencies` 以 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2` 为 key 指向补丁文件，
+`patchedDependencies` 以 `@deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.2` 为 key 指向补丁文件
+（旧 key 为 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2`），
 lockfile 的 `patch_hash` 记录其内容；`pnpm install` 与 `dsh plugin add` 都会重放它。
 
 由此带来两个约束：
 
-- **key 与版本强绑定**。官方包升到新版本后 key 不再匹配，pnpm 既不报错也不应用，补丁静默
-  失效 —— 这正是额度面板长时间空白、却看不出根因的原因。
+- **key 与版本强绑定**。key 必须**精确等于**被补丁包版本；官方包升到新版本后 key 不再匹配，
+  pnpm 既不报错也不应用，补丁静默失效 —— 这正是额度面板长时间空白、却看不出根因的原因。
 - 版本变更后需要：重命名补丁文件、更新 `patchedDependencies` 的 key、按上表重做改动、
   执行 `pnpm install --no-frozen-lockfile`。**完整步骤与锚点见
   [README · 官方包补丁与升级适配](../README.md#官方包补丁与升级适配)。**
@@ -162,8 +164,12 @@ lockfile 的 `patch_hash` 记录其内容；`pnpm install` 与 `dsh plugin add` 
 | Node.js | `>=22.19.0` | `AbortSignal.timeout`、原生 `fetch`、`Buffer` `base64url`、内置 `node:test` |
 | DeepSeek Harness | `>= 0.2.0-rc.2` | `credentials.resolve(ref, options)` 需支持第二参 `proxyUrl`；`configForms` / 槽位 API |
 | `undici` | `^8.11.2` | `ProxyAgent` API |
-| 补丁目标包 | 精确 `@deepseek-ai/dsh-llm-pi-ai@0.2.0-rc.2` | patch 以该版本的文件内容为基准；版本变更后需重做补丁并更新 `patchedDependencies` 的 key，见 [README](../README.md#官方包补丁与升级适配) |
+| 补丁目标包 | 精确 `@deepseek-ai/dsh-llm-pi-ai@0.2.1-rc.2` | patch 以该版本的文件内容为基准；版本变更后需重做补丁并更新 `patchedDependencies` 的 key，见 [README](../README.md#官方包补丁与升级适配) |
 | `@deepseek-ai/dsh-host-webserver` | 提供 `webServer` 服务 | 额度面板的数据通道；缺失时面板降级为「不可用」，不影响核心功能 |
+
+> 上表的 `>= 0.2.0-rc.2` 是**宿主最低版本**；而补丁目标包是**精确的** ——
+> `patchedDependencies` 的 key 与补丁文件名必须**精确等于宿主实际安装的 `@deepseek-ai/dsh-llm-pi-ai`
+> 版本**（当前 `0.2.1-rc.2`），二者不是一回事。
 
 ## 7. 依赖流向小结
 
@@ -171,12 +177,14 @@ lockfile 的 `patch_hash` 记录其内容；`pnpm install` 与 `dsh plugin add` 
   账号池）→ `<账号>/auth.json` →（可选 `undici.ProxyAgent`）→ `auth.openai.com`。
 - **额度观测链路（被动）**：模型响应 → `wrapFetch` → `observe()` → `pool.tokens` 反查账号
   → `recordOutcome()` 合并 `x-codex-*` 响应头。
-- **额度观测链路（主动）**：`claim()` → `probeAccount()` →（同一 `ProxyAgent`）→
-  `chatgpt.com/backend-api/wham/usage` → `recordQuota()`。
+- **额度观测链路（主动）**：`claim()` → `probeAccount()` → `readQuota()`（先订阅
+  `POST …/wham/usage/subscriptions`，失败才拉取 `GET …/wham/usage`，同一 `ProxyAgent`）
+  → `recordQuota()`（把 `renewal_seconds` 记为读数的租期，驱动下一次读取）。
 - **启动预热链路**：`apply()` → `void service.warm()` → `discoverAccounts()` → `warmPool()`
-  （立即列出账号，无需模型请求）→ `quotaProbe` 打开时 `probeAll(accounts, settings.proxyUrl)`
+  （立即列出账号，无需模型请求；打开面板时 `{ force: true }` 还会 `resetProbeAttempts()` 并全读）
+  → `quotaProbe` 打开时 `probeAll(accounts, settings.proxyUrl, { force })`
   →（配置了 `proxyUrl` 则同一 `ProxyAgent`，否则直连）→ `recordQuota()`；
-  若 provider 的代理与此不同，首个 `resolve()` 会经 `noteProbeProxy()` 对未测得账号补探一次。
+  若 provider 的代理与此不同，首个 `resolve()` 会经 `noteProbeProxy()` 对未测得账号补读一次。
 - **配置/UI 链路**：DSH 设置页 → `configForms("llm-pi-ai")` → `client.js`
   → `ProxyField` 写 `providers["openai-codex"].proxyUrl`（被补丁后的 `llm-pi-ai` 读取并生效）
   ／ `QuotaPanel` 读同源 `GET /api/codex-pool`（由 `webServer` 路由返回池快照）。
