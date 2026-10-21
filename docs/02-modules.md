@@ -17,7 +17,7 @@ deepseek-harness-codex-auth/
 │   └── @deepseek-ai__dsh-llm-pi-ai@0.2.0-rc.2.patch   # 仅供仍停在 dsh 0.2.0-rc.2 的宿主
 ├── test/
 │   ├── auth.test.js         # 认证桥单测（4 例）
-│   ├── pool.test.js         # 账号池 / 额度 / 轮换 / 预热 / 探测重试单测（22 例）
+│   ├── pool.test.js         # 账号池 / 额度 / 轮换 / 预热 / 探测重试单测（23 例）
 │   └── probe.test.js        # 额度读取：窗口分槽与订阅优先单测（5 例）
 ├── package.json             # 包元数据 + dsh bundle/client 声明
 ├── package-lock.json        # 依赖锁（undici）
@@ -86,7 +86,8 @@ deepseek-harness-codex-auth/
 - `parseQuota(headers, now)`：读 `x-codex-primary-used-percent`（5 小时）、
   `x-codex-secondary-used-percent`（本周）、`…-reset-at` / `…-reset-after-seconds` / `…-window-minutes`。
   reset 支持 epoch 秒、epoch 毫秒、ISO 字符串，缺省回退 `reset-after-seconds`。
-- `mergeQuota(previous, next)` / `expireWindows(quota, now)`：合并新读数、把已过期的窗口归零。
+- `mergeQuota(previous, next)` / `expireWindows(quota, now)`：合并新读数；重置时刻已过的窗口连同
+  使用率一起清成未观测，避免把「没人看过的新窗口」显示成 100% 剩余（轮换侧仍视作未用）。
 - `hasQuota()` / `peakUsedPercent()` / `isQuotaExhausted()`（任一窗口 ≥ 100%）/ `quotaRetryAt()`。
 - `readHeader(headers, name)`：兼容 `Headers` 实例与普通对象。
 
@@ -171,6 +172,8 @@ deepseek-harness-codex-auth/
   全部账号），随后每 **15 秒** `GET` 一次（与设置页同源，无需额外鉴权面）；
 - 展示的是**「剩余 N%」而非「已用」**：`remainingPercent(usedPercent) = 100 - usedPercent`，
   `toneFor` 分档 ≤0 耗尽 / ≤20 告警 / 其余正常 / 未知 idle，`Meter` 据此渲染进度条与重置倒计时；
+- 读数超过 **1 小时**没有更新时，`Meter` 显示「读数过期 · N 小时前」并清空进度条，而不是把旧数字
+  当作实时值；已重置但尚未重新观测的窗口显示「暂无数据」。快照为此携带 `quotaObservedAt`；
 - 网络失败时保留最后一次读数，并把角标降级为「已断开」；从未成功过则提示
   「多账号额度不可用（当前运行环境未提供 Web 接口）」；
 - 账号列表为空时先看 `snapshot.integration`：`hooked === false && stockAdapter === true`
@@ -275,7 +278,7 @@ dsh 0.2.0-rc.2 的宿主）。
 
 ## test/ — 单元测试
 
-`npm test` 运行三个文件，共 **31** 个用例（`node:test` + `node:assert/strict`）。
+`npm test` 运行三个文件，共 **32** 个用例（`node:test` + `node:assert/strict`）。
 
 **test/auth.test.js（4 例，认证桥）**
 
@@ -286,7 +289,7 @@ dsh 0.2.0-rc.2 的宿主）。
 | `only intercepts the dedicated credential reference` | 非目标引用透传；`dispose()` 还原 `resolve/describe` |
 | `reports the live Codex login as a configured read-only credential` | `describe` 返回 `writable: false` |
 
-**test/pool.test.js（22 例，账号池）**
+**test/pool.test.js（23 例，账号池）**
 
 | 用例 | 验证点 |
 | --- | --- |
@@ -299,6 +302,7 @@ dsh 0.2.0-rc.2 的宿主）。
 | `earliestQuotaDueAt` 指出池内最早到期读数 | 空池 `undefined`；未读过的账号即刻到期 |
 | hybrid 偏好有余额账号并跳过限流账号 | `selectAccount` |
 | 窗口重置后账号重回轮换 | `expireWindows` + `isAvailable` |
+| 窗口重置后读数未被观测而非 100% | `expireWindows` 清空使用率；快照给出 `quotaObservedAt` |
 | 固定账号优先于策略，清除后回到策略 | `setPinned` + `selectAccount` |
 | 固定账号耗尽时让位、窗口重置后回归 | 兜底语义 |
 | 账号消失时固定被丢弃 | `prunePool` 清理 `pinned` |

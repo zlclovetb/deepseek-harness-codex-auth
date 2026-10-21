@@ -15,6 +15,10 @@ window.__ModuleLoader__.load({
 
     const QUOTA_ROUTE = "/api/codex-pool"
     const POLL_INTERVAL_MS = 15_000
+    // The lease re-reads at most every few minutes; an hour without a reading
+    // means the credential or the transport stopped working, not that the
+    // window is untouched — so the number must not be presented as current.
+    const QUOTA_STALE_MS = 60 * 60 * 1000
     const STRATEGY_LABEL = { hybrid: "智能选择", "round-robin": "轮询", sticky: "固定账号" }
     const STATE_COLOR = {
       ok: "var(--dsw-alias-state-success-primary)",
@@ -151,17 +155,21 @@ window.__ModuleLoader__.load({
       return remaining <= 20 ? "warn" : "ok"
     }
 
-    function Meter({ label, remaining, resetAt, now }) {
+    function Meter({ label, remaining, resetAt, now, observedAt }) {
+      const stale = typeof observedAt === "number" && Number.isFinite(observedAt) && now - observedAt > QUOTA_STALE_MS
       const known = typeof remaining === "number" && Number.isFinite(remaining)
       const left = known ? Math.max(0, Math.min(100, Math.round(remaining))) : 0
-      const reset = known ? resetLabel(resetAt, now) : undefined
+      const reset = known && !stale ? resetLabel(resetAt, now) : undefined
+      const text = stale
+        ? `读数过期 · ${sinceLabel(observedAt, now) ?? "未更新"}`
+        : known ? `剩余 ${left}%${reset ? ` · ${reset}` : ""}` : "暂无数据"
       return jsxs("div", { style: { display: "flex", flexDirection: "column", gap: 4, minWidth: 0 }, children: [
         jsxs("div", { style: { display: "flex", justifyContent: "space-between", gap: 8, fontSize: 11, color: "var(--dsw-alias-label-secondary)" }, children: [
           jsx("span", { children: label }),
-          jsx("span", { style: { fontVariantNumeric: "tabular-nums" }, children: known ? `剩余 ${left}%${reset ? ` · ${reset}` : ""}` : "暂无数据" }),
+          jsx("span", { style: { fontVariantNumeric: "tabular-nums" }, children: text }),
         ] }),
         jsx("div", { style: { position: "relative", height: 6, borderRadius: 999, background: "var(--dsw-alias-bg-layer-2)", overflow: "hidden" }, children:
-          jsx("div", { style: { position: "absolute", inset: 0, width: `${left}%`, borderRadius: 999, background: STATE_COLOR[toneFor(remaining)] } }) }),
+          jsx("div", { style: { position: "absolute", inset: 0, width: `${stale ? 0 : left}%`, borderRadius: 999, background: STATE_COLOR[stale ? "idle" : toneFor(remaining)] } }) }),
       ] })
     }
 
@@ -181,8 +189,8 @@ window.__ModuleLoader__.load({
           jsx("button", { type: "button", disabled: busy, onClick: () => onTogglePin(isPinned ? null : account.id), style: smallButtonStyle, children: isPinned ? "取消固定" : "用此账号" }),
         ] }),
         jsx("span", { style: { color: "var(--dsw-alias-label-secondary)", fontSize: 11, fontVariantNumeric: "tabular-nums" }, children: meta }),
-        jsx(Meter, { label: "5 小时窗口", remaining: remainingPercent(account.usedPercent5h), resetAt: account.resetsAt5h, now }),
-        jsx(Meter, { label: "本周窗口", remaining: remainingPercent(account.usedPercentWeekly), resetAt: account.resetsAtWeekly, now }),
+        jsx(Meter, { label: "5 小时窗口", remaining: remainingPercent(account.usedPercent5h), resetAt: account.resetsAt5h, now, observedAt: account.quotaObservedAt }),
+        jsx(Meter, { label: "本周窗口", remaining: remainingPercent(account.usedPercentWeekly), resetAt: account.resetsAtWeekly, now, observedAt: account.quotaObservedAt }),
       ] })
     }
 

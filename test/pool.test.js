@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 
 import { apply, CODEX_CREDENTIAL_REF } from "../index.js";
 import { discoverAccounts, accountIdentity } from "../lib/accounts.js";
-import { parseQuota, isQuotaExhausted, quotaRetryAt } from "../lib/quota.js";
+import { parseQuota, expireWindows, isQuotaExhausted, quotaRetryAt } from "../lib/quota.js";
 import { USAGE_URL, SUBSCRIPTIONS_URL, readQuota } from "../lib/probe.js";
 import {
   createPool,
@@ -173,6 +173,29 @@ test("a window that has already reset returns the account to rotation", async ()
   });
   const later = now + 61_000;
   assert.equal(selectAccount(pool, accounts, { now: later }).id, "alpha");
+});
+
+test("a rolled-over window reads as unobserved instead of a confident 100%", async () => {
+  const dir = await writePool({ alpha: "acct-a", bravo: "acct-b" });
+  const { accounts } = await discoverAccounts({ accountsDir: dir });
+  const pool = createPool({ strategy: "hybrid" });
+  const now = Date.now();
+  recordOutcome(pool, "alpha", {
+    status: 200,
+    headers: { "x-codex-primary-used-percent": "97", "x-codex-primary-reset-after-seconds": "60" },
+    now
+  });
+  const later = now + 120_000;
+  const quota = expireWindows(pool.accounts.get("alpha").quota, later);
+  // Reporting 0% here would turn "nobody looked at the new window" into a
+  // panel that claims 100% remaining, which is exactly the misleading number.
+  assert.equal(quota.primaryUsedPercent, undefined);
+  assert.equal(quota.primaryResetsAt, undefined);
+  // Rotation still treats it as untouched, so the account keeps serving.
+  assert.equal(selectAccount(pool, accounts, { now: later }).id, "alpha");
+  // The snapshot says when the last reading was taken, so the panel can mark
+  // it stale rather than trusting it forever.
+  assert.equal(poolSnapshot(pool, later).accounts.find((entry) => entry.id === "alpha").quotaObservedAt, now);
 });
 
 test("a pin outranks the strategy until it is released", async () => {

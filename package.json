@@ -1,6 +1,6 @@
 {
   "name": "deepseek-harness-codex-auth",
-  "version": "0.4.6",
+  "version": "0.4.7",
   "description": "Use the Codex CLI login as the OpenAI Codex credential in DeepSeek Harness",
   "type": "module",
   "main": "index.js",

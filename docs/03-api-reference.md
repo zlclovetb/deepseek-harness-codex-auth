@@ -330,7 +330,7 @@ function wrapFetch(baseFetch) {
 | `parseQuota(headers, now)` | → `{ observedAt, primaryUsedPercent, primaryResetsAt, primaryWindowMinutes, secondary… }`；缺省字段保持 `undefined` |
 | `hasQuota(quota)` | 是否至少有一个可用数字 |
 | `mergeQuota(previous, next)` | 用新读数覆盖，`undefined` 不覆盖旧值 |
-| `expireWindows(quota, now)` | 重置时刻已过的窗口清零并清掉 reset 时间 |
+| `expireWindows(quota, now)` | 重置时刻已过的窗口把使用率与 reset 时间一起清掉（回到未观测） |
 | `peakUsedPercent(quota)` | 两个窗口中的最高使用率 |
 | `isQuotaExhausted(quota)` | `peak >= 100` |
 | `quotaRetryAt(quota)` | 已满窗口中最晚的重置时刻 |
@@ -402,6 +402,7 @@ function wrapFetch(baseFetch) {
       "resetsAt5h": 1760003600000,
       "usedPercentWeekly": 48,
       "resetsAtWeekly": 1760500000000,
+      "quotaObservedAt": 1760000000000,
       "health": 1,
       "cooldownUntil": null,
       "lastUsedAt": 1760000000000,
@@ -475,11 +476,13 @@ React 组件（用 `jsx`/`jsxs` 手写，无 JSX 编译）。职责：为 `opena
 「刚刚 / N 分钟前 / N 小时前 / N 天前」（用于「上次使用」），后者「N 分钟后重置 / N 小时后重置 /
 N 天后重置」。
 
-### `Meter({ label, remaining, resetAt, now })` / `AccountRow({ account, now, isCurrent, isPinned, busy, onTogglePin })`
+### `Meter({ label, remaining, resetAt, now, observedAt })` / `AccountRow({ account, now, isCurrent, isPinned, busy, onTogglePin })`
 用量进度条与账号行：5 小时 / 本周两条，轨道用 `--dsw-alias-bg-layer-2`，
 填充色按**剩余**取 `--dsw-alias-state-success-primary`（>20%）/
 `--dsw-alias-state-warn-primary`（≤20%）/ `--dsw-alias-state-error-primary`（≤0）；
-读数未知（`remaining` 为 `null`）时显示「暂无数据」，不借用另一个窗口的数字。`AccountRow` 首行为
+读数未知（`remaining` 为 `undefined`）时显示「暂无数据」，不借用另一个窗口的数字。
+`observedAt` 取自快照的 `quotaObservedAt`：超过 `QUOTA_STALE_MS`（1 小时）未更新时改显
+「读数过期 · N 小时前」并清空进度条，避免把撑过凭据有效期的旧数字当作实时值。`AccountRow` 首行为
 账号 id 加条件渲染的「当前」/「已固定」标记，次行为「上次使用 …／尚未使用」与健康状况
 （`health < 0.95` 时显示），尾部角标显示可用 / 冷却中 / 额度耗尽，以及手动固定按钮
 （「用此账号」↔「取消固定」，`busy` 期间禁用）。

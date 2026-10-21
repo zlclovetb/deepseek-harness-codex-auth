@@ -24,20 +24,20 @@ npm test             # 运行 node --test（test/ 下三个文件）
 npm run pack:check   # 预览打包内容（npm pack --dry-run）
 ```
 
-`npm test` 覆盖三个文件共 31 个用例（auth 4 + pool 22 + probe 5）：未过期直接返回（无网络）、
+`npm test` 覆盖三个文件共 32 个用例（auth 4 + pool 23 + probe 5）：未过期直接返回（无网络）、
 过期刷新并保留 auth 文档、只拦截目标引用且 dispose 可还原、describe 报告只读状态；以及账号发现
-（含单账号回退）、额度响应头解析、hybrid 选择与限流跳过、窗口重置后重回轮换、`apply()` 端到端
-打桩与启动预热、手动固定（含兜底与 prune 清理）、`wrapFetch` 观测额度且不改响应、面板经路由固定
-账号，以及**额度读取**（订阅优先 / 拉取兜底）、**服务端租期**的调度、探测失败退避与次数用尽停探；
-probe 侧重窗口分槽（按声明长度而非字段名）。
+（含单账号回退）、额度响应头解析、hybrid 选择与限流跳过、窗口重置后重回轮换（并保持"未观测"而非
+100% 剩余）、`apply()` 端到端打桩与启动预热、手动固定（含兜底与 prune 清理）、`wrapFetch` 观测额度且
+不改响应、面板经路由固定账号，以及**额度读取**（订阅优先 / 拉取兜底）、**服务端租期**的调度、
+探测失败退避与次数用尽停探；probe 侧重窗口分槽（按声明长度而非字段名）。
 
 ## 3. 打包与安装
 
 ```powershell
 npm pack
-# 生成 deepseek-harness-codex-auth-<version>.tgz（当前 0.4.6）
+# 生成 deepseek-harness-codex-auth-<version>.tgz（当前 0.4.7）
 
-dsh plugin --profile web add .\deepseek-harness-codex-auth-0.4.6.tgz
+dsh plugin --profile web add .\deepseek-harness-codex-auth-0.4.7.tgz
 dsh --profile web --dump-config     # 确认 patch 已应用
 dsh web                             # 启动
 ```

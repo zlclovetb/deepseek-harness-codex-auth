@@ -89,7 +89,7 @@ codex login status
 ```powershell
 npm test
 npm pack
-dsh plugin --profile web add .\deepseek-harness-codex-auth-0.4.6.tgz
+dsh plugin --profile web add .\deepseek-harness-codex-auth-0.4.7.tgz
 dsh --profile web --dump-config
 dsh web
 ```
@@ -102,7 +102,8 @@ Web profile 同时应用 `patches/@deepseek-ai__dsh-llm-pi-ai@0.2.1-rc.2.patch` 
 建议同时把 `transport` 设为 `sse`，避免不支持 WebSocket 的 HTTP 代理先等待握手超时。
 额度面板打开时即 `POST /api/codex-pool {refresh:true}` 强制重读全部账号，随后每 15 秒 `GET` 一次
 同源快照；面板按**「剩余 N%」**展示各账号的 5 小时 / 本周窗口与重置倒计时，并可在面板内点
-「用此账号」手动固定账号（`POST` 同一条路由）。
+「用此账号」手动固定账号（`POST` 同一条路由）。读数超过 1 小时没更新时改显「读数过期 · N 小时前」；
+窗口已重置但还没重新观测到时显示「暂无数据」，不会把旧数字当成 100% 剩余。
 
 卸载：
 
